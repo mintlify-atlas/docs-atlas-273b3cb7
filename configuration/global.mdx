@@ -1,0 +1,193 @@
+---
+title: 'Global Configuration for sidekiq-unique-jobs'
+description: 'Set application-wide defaults for lock behavior, TTL, conflict handling, orphan reaping, and digest algorithm using the SidekiqUniqueJobs.configure block.'
+keywords: ['sidekiq-unique-jobs', 'configure', 'global config', 'lock_ttl', 'lock_timeout', 'reaper', 'digest_algorithm']
+---
+
+Global configuration lets you set sensible defaults for every job in your application without repeating options on each worker class. Call `SidekiqUniqueJobs.configure` once during application boot — typically inside `config/initializers/sidekiq.rb` — and the settings apply process-wide. Individual workers can always override specific values with `sidekiq_options`.
+
+```ruby
+# config/initializers/sidekiq.rb
+SidekiqUniqueJobs.configure do |config|
+  config.lock_ttl         = nil
+  config.lock_timeout     = 0
+  config.lock_prefix      = "uniquejobs"
+  config.on_conflict      = nil
+  config.lock_info        = false
+  config.enabled          = true
+  config.reaper           = :ruby
+  config.reaper_count     = 1000
+  config.reaper_interval  = 600
+  config.reaper_timeout   = 10
+  config.digest_algorithm = :legacy
+end
+```
+
+## Options
+
+<ParamField path="lock_ttl" type="integer" default="nil">
+  Number of seconds after which a lock automatically expires in Redis. When `nil`, locks have no expiration and are held until the gem explicitly releases them. Set a TTL as a safety net against orphaned locks left behind by crashed worker processes.
+
+  ```ruby
+  config.lock_ttl = 3600  # locks expire after 1 hour
+  ```
+</ParamField>
+
+<ParamField path="lock_timeout" type="integer" default="0">
+  Number of seconds to wait when attempting to acquire a lock that is already held. `0` means fail immediately without waiting. A positive integer causes the lock attempt to block for up to that many seconds before giving up and invoking the configured conflict strategy.
+
+  ```ruby
+  config.lock_timeout = 5  # wait up to 5 seconds for the lock
+  ```
+</ParamField>
+
+<ParamField path="lock_prefix" type="string" default="uniquejobs">
+  The string prepended to every Redis key managed by the gem. Changing the prefix lets you share a Redis instance between environments or multiple applications without key collisions.
+
+  ```ruby
+  config.lock_prefix = "myapp:uniquejobs"
+  ```
+</ParamField>
+
+<ParamField path="on_conflict" type="symbol" default="nil">
+  The global default conflict strategy applied when a lock cannot be acquired and no per-job `on_conflict` is set. When `nil`, the gem falls back to the `:log` strategy (log and discard). Accepted values: `:log`, `:raise`, `:reject`, `:replace`, `:reschedule`, or any symbol registered via `add_strategy`.
+
+  ```ruby
+  config.on_conflict = :log
+  ```
+</ParamField>
+
+<ParamField path="lock_info" type="boolean" default="false">
+  When `true`, the gem stores additional metadata about each lock in Redis — the worker class, queue, job arguments, and the time the lock was acquired. Useful for debugging digest issues but adds overhead on every lock operation. Disable in production unless actively troubleshooting.
+
+  ```ruby
+  config.lock_info = true
+  ```
+</ParamField>
+
+<ParamField path="enabled" type="boolean" default="true">
+  Master switch for the entire gem. When set to `false`, the client and server middleware pass all jobs through without checking or setting any locks. Disabling globally is the recommended way to opt out of uniqueness enforcement in test environments.
+
+  ```ruby
+  config.enabled = false  # disable in tests
+  ```
+</ParamField>
+
+<ParamField path="reaper" type="symbol" default=":ruby">
+  Controls which reaper implementation cleans up orphaned locks. Orphaned locks are created when a worker process crashes before it can release a lock.
+
+  | Value | Behavior |
+  |-------|----------|
+  | `:ruby` | Default. Runs in a background Ruby thread. Safe and non-blocking for Redis. |
+  | `:lua` | Executes a Lua script in Redis. Faster but blocks Redis during the scan. Keep `reaper_count` low (≤ 1000) when using this option. |
+  | `:none` or `false` | Disables the reaper entirely. Orphaned locks must be cleaned up manually or via TTL. |
+
+  ```ruby
+  config.reaper = :ruby
+  ```
+</ParamField>
+
+<ParamField path="reaper_count" type="integer" default="1000">
+  Maximum number of orphaned lock digests to delete in a single reaper cycle. Lower values reduce Redis load per cycle at the cost of slower overall cleanup when there are many orphans.
+
+  ```ruby
+  config.reaper_count = 500
+  ```
+</ParamField>
+
+<ParamField path="reaper_interval" type="integer" default="600">
+  Number of seconds between reaper runs. The default of `600` runs the reaper every 10 minutes. Reduce this if your application creates many short-lived workers that crash frequently.
+
+  ```ruby
+  config.reaper_interval = 300  # run every 5 minutes
+  ```
+</ParamField>
+
+<ParamField path="reaper_timeout" type="integer" default="10">
+  Maximum number of seconds a single reaper run is allowed to take before it is stopped. Prevents a slow Redis scan from blocking the reaper's background thread indefinitely.
+
+  ```ruby
+  config.reaper_timeout = 30
+  ```
+</ParamField>
+
+<ParamField path="digest_algorithm" type="symbol" default=":legacy">
+  The hashing algorithm used to compute lock digests from job arguments.
+
+  | Value | Algorithm | Notes |
+  |-------|-----------|-------|
+  | `:legacy` | MD5 | Default. Smaller digests, but not FIPS-compliant. |
+  | `:modern` | SHA3-256 | FIPS-compatible. Required on systems with FIPS-mode Redis or Ruby builds. |
+
+  Switching algorithms after deployment will invalidate all existing locks. Only change this during a maintenance window or before the first deployment.
+
+  ```ruby
+  config.digest_algorithm = :modern
+  ```
+</ParamField>
+
+## Registering custom locks and strategies
+
+### `add_lock(name, klass)`
+
+Registers a custom lock implementation under the given symbol. The lock class must inherit from `SidekiqUniqueJobs::Lock::BaseLock`. Raises `SidekiqUniqueJobs::DuplicateLock` if the name is already taken.
+
+```ruby
+class CustomLock < SidekiqUniqueJobs::Lock::BaseLock
+  def lock
+    # custom acquire logic
+  end
+
+  def execute
+    yield
+  end
+end
+
+SidekiqUniqueJobs.configure do |config|
+  config.add_lock(:my_custom_lock, CustomLock)
+end
+
+# Use it on any worker:
+# sidekiq_options lock: :my_custom_lock
+```
+
+### `add_strategy(name, klass)`
+
+Registers a custom conflict strategy under the given symbol. The strategy class must inherit from `SidekiqUniqueJobs::OnConflict::Strategy` and implement a `call` method. Raises `SidekiqUniqueJobs::DuplicateStrategy` if the name is already taken.
+
+```ruby
+class NotifyStrategy < SidekiqUniqueJobs::OnConflict::Strategy
+  def call
+    MyAlerts.notify("Duplicate job dropped", item["class"])
+  end
+end
+
+SidekiqUniqueJobs.configure do |config|
+  config.add_strategy(:notify, NotifyStrategy)
+end
+
+# Use it on any worker:
+# sidekiq_options lock: :until_executed, on_conflict: :notify
+```
+
+## Temporary overrides in tests
+
+`SidekiqUniqueJobs.use_config` yields a copy of the current configuration, applies your block, and restores the original settings when the block exits. Use it in tests to override specific settings without affecting other examples.
+
+```ruby
+RSpec.describe MyJob do
+  around do |example|
+    SidekiqUniqueJobs.use_config(enabled: false) do
+      example.run
+    end
+  end
+
+  it "enqueues the job" do
+    expect { MyJob.perform_async(1) }.to change(MyJob.jobs, :size).by(1)
+  end
+end
+```
+
+<Note>
+  `use_config` accepts a hash of attribute overrides and is thread-safe. It is the preferred way to temporarily change configuration in tests rather than mutating `SidekiqUniqueJobs.config` directly.
+</Note>

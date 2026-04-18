@@ -1,0 +1,103 @@
+---
+title: 'Conflict Strategies for sidekiq-unique-jobs'
+description: 'Control what happens when a duplicate Sidekiq job is detected. Choose from five built-in conflict strategies or set different ones per enqueue and execution phase.'
+keywords: ['sidekiq', 'conflict', 'on_conflict', 'duplicate jobs', 'lock conflict']
+---
+
+When sidekiq-unique-jobs detects a duplicate job — meaning the lock for that job is already held — it hands control to a **conflict strategy**. The strategy decides the fate of the incoming duplicate: silently discard it, raise an error, send it to the dead set, replace the existing job, or schedule it to run again later. Choosing the right strategy for each job class lets you balance visibility, reliability, and correctness without writing any custom middleware.
+
+## What is a conflict?
+
+A conflict occurs at the moment a lock acquisition fails. This can happen on two distinct sides of the Sidekiq lifecycle:
+
+- **Client side** — when a job is pushed to the queue and a lock for the same digest already exists (e.g., the job is already waiting or running).
+- **Server side** — when a worker thread picks up a job and the lock cannot be acquired before execution begins (relevant for locks such as `:while_executing`).
+
+Because client and server conflicts happen at different points in the lifecycle, you can configure separate strategies for each.
+
+## Built-in strategies
+
+Five strategies ship with the gem out of the box:
+
+| Strategy | Behavior |
+|---|---|
+| `:log` | Log the duplicate at info level and discard it silently |
+| `:raise` | Raise `SidekiqUniqueJobs::Conflict`, which causes Sidekiq to retry the job |
+| `:reject` | Send the duplicate to Sidekiq's dead set (morgue) |
+| `:replace` | Delete the existing queued job and enqueue the new one in its place |
+| `:reschedule` | Schedule the duplicate to run again after a short delay (default: 5 seconds) |
+
+The global default when no strategy is configured is `:log` — duplicates are discarded with an informational log message and no other side effects.
+
+## Configuring a strategy
+
+### Global default
+
+Set a default strategy for every job in your application via the configure block:
+
+```ruby
+SidekiqUniqueJobs.configure do |config|
+  config.on_conflict = :log
+end
+```
+
+The `on_conflict` option accepts any built-in strategy symbol or the name of a custom strategy you have registered.
+
+### Per-job configuration
+
+Override the global default for a specific worker using `sidekiq_options`:
+
+```ruby
+class ReportJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executed, on_conflict: :reject
+
+  def perform(report_id)
+    # Only one report generation runs at a time; duplicates go to the dead set
+  end
+end
+```
+
+### Separate client and server strategies
+
+Locks such as `:until_and_while_executing` span both the enqueue phase and the execution phase. You can pass a hash to `on_conflict` to apply different strategies at each side:
+
+```ruby
+class SyncJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_and_while_executing,
+                  on_conflict: { client: :log, server: :reschedule }
+
+  def perform(account_id)
+    # Duplicate enqueues are logged and dropped;
+    # duplicates that reach a worker are rescheduled
+  end
+end
+```
+
+The `:client` key controls what happens when a duplicate is detected at enqueue time. The `:server` key controls what happens when a duplicate is detected at execution time.
+
+## Strategy reference
+
+<CardGroup cols={2}>
+  <Card title=":log" icon="scroll" href="/conflict/strategies#log">
+    Log and discard the duplicate. The default strategy — no noise, no retries.
+  </Card>
+  <Card title=":raise" icon="triangle-alert" href="/conflict/strategies#raise">
+    Raise an error and let Sidekiq's retry mechanism handle it.
+  </Card>
+  <Card title=":reject" icon="skull" href="/conflict/strategies#reject">
+    Send the duplicate directly to the dead set for manual inspection.
+  </Card>
+  <Card title=":replace" icon="arrows-rotate" href="/conflict/strategies#replace">
+    Delete the existing queued job and enqueue the new one in its place.
+  </Card>
+  <Card title=":reschedule" icon="clock" href="/conflict/strategies#reschedule">
+    Schedule the duplicate to run again after a short delay.
+  </Card>
+  <Card title="Custom strategies" icon="wrench" href="/conflict/strategies#custom-strategies">
+    Implement your own strategy class and register it with the gem.
+  </Card>
+</CardGroup>

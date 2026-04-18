@@ -1,0 +1,141 @@
+---
+title: 'Testing Jobs with sidekiq-unique-jobs Enabled'
+description: 'Disable lock enforcement in your test suite, use temporary config overrides per example, and understand how Sidekiq testing modes interact with uniqueness.'
+keywords: ['testing', 'rspec', 'disable uniqueness', 'use_config', 'sidekiq testing', 'sidekiq-unique-jobs']
+---
+
+sidekiq-unique-jobs enforces locks at the point of enqueue and execution. In a test suite, that behavior causes one test's job to block a later test's enqueue — because the lock from the first job is still held when the second test runs. The recommended approach is to disable lock enforcement globally in your test helper and re-enable it only in the handful of tests that specifically cover uniqueness behavior.
+
+## Disabling uniqueness globally
+
+Add a single line to your test helper to turn off lock enforcement for the entire test suite:
+
+```ruby
+# spec/rails_helper.rb  (or test/test_helper.rb)
+SidekiqUniqueJobs.config.enabled = false
+```
+
+When `enabled` is `false`, the client and server middleware pass every job through without acquiring or releasing any locks. Jobs enqueue and execute normally. No Redis lock keys are written or read.
+
+<Warning>
+  Do not write tests that verify the gem's uniqueness behavior from within your application's test suite. The gem has its own comprehensive test suite that covers lock correctness. Re-testing it in your app tests adds friction without value and makes your suite brittle to gem version changes.
+</Warning>
+
+## Temporary overrides with `use_config`
+
+`SidekiqUniqueJobs.use_config` accepts a hash of configuration overrides, yields a block with those overrides active, and restores the original configuration when the block exits. Use it when you need uniqueness enabled for a specific test:
+
+```ruby
+RSpec.describe MyJob do
+  around do |example|
+    SidekiqUniqueJobs.use_config(enabled: true) do
+      example.run
+    end
+  end
+
+  it "drops a duplicate enqueue" do
+    Sidekiq::Testing.fake! do
+      MyJob.perform_async(42)
+      MyJob.perform_async(42)
+
+      expect(MyJob.jobs.size).to eq(1)
+    end
+  end
+end
+```
+
+`use_config` is thread-safe. It is the preferred way to temporarily modify configuration rather than mutating `SidekiqUniqueJobs.config` directly and resetting manually.
+
+## RSpec helper pattern
+
+A common pattern is to disable uniqueness globally in `rails_helper.rb` and provide a shared context for tests that need it enabled:
+
+```ruby
+# spec/rails_helper.rb
+SidekiqUniqueJobs.config.enabled = false
+
+# spec/support/unique_jobs.rb
+RSpec.shared_context "with unique jobs enabled" do
+  around do |example|
+    SidekiqUniqueJobs.use_config(enabled: true) { example.run }
+  end
+end
+```
+
+Then include it selectively:
+
+```ruby
+RSpec.describe MyJob do
+  include_context "with unique jobs enabled"
+
+  it "prevents duplicate enqueues" do
+    # uniqueness is active for this describe block only
+  end
+end
+```
+
+## Sidekiq::Testing modes
+
+sidekiq-unique-jobs works with all three Sidekiq testing modes. Understanding the interaction helps you write accurate tests.
+
+### `Sidekiq::Testing.fake!` (default)
+
+Jobs are pushed to an in-memory queue (`MyJob.jobs`) rather than Redis. The client middleware still runs, so uniqueness checks happen at enqueue time if `enabled` is `true`. Locks are stored in Redis during enqueuing.
+
+When you call `MyJob.clear` or `Sidekiq::Worker.clear_all` in tests, sidekiq-unique-jobs automatically removes the corresponding locks from Redis so they do not leak between tests. This cleanup is built into the testing extension loaded by `require "sidekiq_unique_jobs/testing"`.
+
+```ruby
+# spec/rails_helper.rb
+require "sidekiq_unique_jobs/testing"
+
+RSpec.configure do |config|
+  config.after(:each) do
+    Sidekiq::Worker.clear_all  # also clears unique job locks
+  end
+end
+```
+
+### `Sidekiq::Testing.inline!`
+
+Jobs execute immediately in the same thread when enqueued. Both client and server middleware run, so both enqueue and execution uniqueness checks are active. Locks are acquired at enqueue, the job executes, and the lock is released — all in the same call to `perform_async`.
+
+This mode is useful for integration tests where you want jobs to complete before assertions run.
+
+### `Sidekiq::Testing.disable!`
+
+Jobs are pushed directly to Redis. Both client middleware (enqueue) and the actual Sidekiq poller are live. This mode requires a running Redis instance and is typically reserved for full end-to-end tests. Clear locks between tests manually or by flushing the relevant Redis keys.
+
+```ruby
+after do
+  Sidekiq.redis { |conn| conn.call("FLUSHDB") }
+end
+```
+
+<Warning>
+  Flushing the entire Redis database in `FLUSHDB` will also remove Sidekiq's queue data and process registrations. Only do this in a test-only Redis instance (separate database or `url: "redis://localhost:6379/1"`).
+</Warning>
+
+## What `require "sidekiq_unique_jobs/testing"` adds
+
+Requiring the testing file:
+
+- Loads `Sidekiq::Testing` in fake mode if it is not already loaded.
+- Adds `SidekiqUniqueJobs::RSpec::Matchers` (automatically included into RSpec) providing the `have_valid_sidekiq_options` matcher.
+- Prepends `clear` on `Sidekiq::Worker` so that clearing a worker's jobs also removes its unique job locks from Redis.
+- Prepends `clear_all` on the worker singleton so clearing all workers cleans up all lock digests.
+
+You should require it once in your test helper, not in individual spec files.
+
+## Validating worker configuration with `have_valid_sidekiq_options`
+
+When `sidekiq_unique_jobs/testing` is required, an RSpec matcher is available that verifies a worker's lock configuration is valid:
+
+```ruby
+require "sidekiq_unique_jobs/testing"
+
+RSpec.describe MyJob do
+  it { is_expected.to have_valid_sidekiq_options }
+end
+```
+
+The matcher calls `SidekiqUniqueJobs.validate_worker` against the worker's `sidekiq_options` and fails with a descriptive error message if the lock type is unknown, required options are missing, or incompatible options are combined. This is useful for catching configuration mistakes at test time rather than at runtime.

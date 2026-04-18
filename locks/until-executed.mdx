@@ -1,0 +1,119 @@
+---
+title: 'until_executed: Lock From Enqueue Through Completion'
+description: 'The until_executed lock holds from job enqueue until the job finishes executing, preventing any duplicate whether queued or already running.'
+keywords: ['until_executed', 'sidekiq lock', 'deduplicate jobs', 'prevent duplicate execution']
+---
+
+The `:until_executed` lock is the most commonly used lock type in sidekiq-unique-jobs. It acquires a Redis lock when the job is enqueued and holds it until the job finishes executing successfully. No duplicate of the same job can be pushed to the queue or start running while the lock is held.
+
+## Aliases
+
+All of the following aliases resolve to the same `SidekiqUniqueJobs::Lock::UntilExecuted` implementation:
+
+- `:until_completed`
+- `:until_performed`
+- `:until_processed`
+- `:until_successfully_completed`
+
+## When to use it
+
+Use `:until_executed` when you need to guarantee that no two identical jobs ever run — whether currently waiting in the queue, already being processed, or retrying after a failure. Typical use cases include syncing records with an external service, sending notifications, or any operation that must not be duplicated at any point in its lifecycle.
+
+## Basic usage
+
+```ruby
+class SyncUserJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executed
+
+  def perform(user_id)
+    User.find(user_id).sync_to_crm
+  end
+end
+```
+
+Using an alias:
+
+```ruby
+sidekiq_options lock: :until_completed
+```
+
+## How it works
+
+The lock is acquired at enqueue time by the client middleware. On the server side, the job executes inside a `locksmith.execute` block. Only after the block completes without raising does the lock get released via `unlock_and_callback`:
+
+```ruby
+# Execute phase (server middleware)
+def execute
+  executed = locksmith.execute do
+    yield
+    item[JID]
+  end
+
+  if executed
+    unlock_and_callback
+  else
+    reflect(:execution_failed, item)
+  end
+
+  nil
+rescue StandardError => ex
+  reflect(:execution_failed, item, ex)
+  raise
+end
+```
+
+<Note>
+If the job raises an exception, the lock is **not** released. This allows the job to retry without a duplicate sneaking in between. The lock is only released after the job completes without error.
+</Note>
+
+## After unlock callbacks
+
+You can define an `after_unlock` method on the worker class to run cleanup logic after the lock is released:
+
+```ruby
+class SyncUserJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executed
+
+  def perform(user_id)
+    User.find(user_id).sync_to_crm
+  end
+
+  def after_unlock
+    # runs after the lock is released
+  end
+end
+```
+
+## Conflict strategies
+
+Conflicts occur on the client side (at enqueue time) when a duplicate is pushed while the lock is held.
+
+| Strategy | Behavior |
+|----------|----------|
+| `:log` (default) | Log and silently drop the duplicate |
+| `:raise` | Raise an exception |
+| `:reject` | Send the duplicate to the Sidekiq dead set |
+| `:replace` | Delete the locked job and enqueue the new one |
+| `:reschedule` | Delay the duplicate and retry enqueuing later |
+
+```ruby
+sidekiq_options lock: :until_executed,
+                on_conflict: :reschedule
+```
+
+## With a lock TTL
+
+You can add a TTL as a safety net to prevent a lock from being held indefinitely if a worker process crashes before releasing it:
+
+```ruby
+sidekiq_options lock: :until_executed,
+                lock_ttl: 3600  # automatically expire after 1 hour
+```
+
+<Warning>
+Setting `lock_ttl` on `:until_executed` means the lock can expire before the job finishes if the job runs longer than the TTL. Size the TTL generously relative to your job's expected runtime.
+</Warning>

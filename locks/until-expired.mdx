@@ -1,0 +1,96 @@
+---
+title: 'until_expired: TTL-Based Lock That Ignores Execution'
+description: 'The until_expired lock holds for a fixed Redis TTL regardless of when the job runs or finishes — ideal for enforcing a time window between identical jobs.'
+keywords: ['until_expired', 'lock_ttl', 'sidekiq time-based lock', 'rate limiting jobs']
+---
+
+The `:until_expired` lock acquires a Redis lock at enqueue time and holds it for a configured duration — regardless of whether the job has run, failed, or been retried. The lock expires when the TTL elapses, not when execution completes. This makes it the right choice when you want to enforce a time window between runs of the same job rather than prevent a specific execution from duplicating.
+
+## When to use it
+
+Use `:until_expired` for jobs that should run at most once per time period: end-of-day reports, hourly cache warming, periodic data exports, or any scheduled task where the constraint is temporal rather than transactional. If you want to run a job no more than once per hour, set `lock_ttl: 3600` and let the TTL do the work.
+
+<Warning>
+`lock_ttl` is **required** for `:until_expired`. Without it the lock has no expiry and the job can never be enqueued again once the lock is acquired.
+</Warning>
+
+## Basic usage
+
+```ruby
+class DailyReportJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_expired,
+                  lock_ttl: 86_400  # 24 hours
+
+  def perform
+    Report.generate_daily
+  end
+end
+```
+
+Hourly uniqueness:
+
+```ruby
+class CacheWarmJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_expired,
+                  lock_ttl: 3600  # 1 hour
+
+  def perform(region)
+    Cache.warm(region)
+  end
+end
+```
+
+## How it works
+
+`:until_expired` inherits from `UntilExecuted` but overrides `execute` to skip the unlock step:
+
+```ruby
+# Execute phase (server middleware) — no unlock after yield
+def execute
+  executed = locksmith.execute do
+    yield
+    item[JID]
+  end
+
+  reflect(:execution_failed, item) unless executed
+end
+```
+
+The lock is acquired on enqueue and left to expire naturally in Redis. There is no `unlock_and_callback` call. This means:
+
+- The job can run and finish, and the lock remains in Redis.
+- Another identical job cannot be enqueued until the TTL elapses.
+- If the job fails or is retried, the lock still remains.
+
+<Note>
+`after_unlock` callbacks are **never** called for `:until_expired` locks. Because the lock expires via Redis TTL rather than an explicit unlock, there is no hook point to trigger the callback.
+</Note>
+
+## Job failures and retries
+
+Because the lock is never explicitly released, a failed job does not free the lock. The next enqueue attempt will be blocked until the TTL expires.
+
+<Warning>
+If your job fails and you want it to retry, those retries will still be blocked by the lock. You have two options: set a short TTL so retries can proceed after the window, or use `:until_executed` instead, which releases the lock on failure so retries can re-acquire it.
+</Warning>
+
+## Conflict strategies
+
+Conflicts occur on the client side when a duplicate is pushed while the lock is held. Since the lock can outlive the job execution, conflicts are more frequent than with other lock types.
+
+```ruby
+sidekiq_options lock: :until_expired,
+                lock_ttl: 3600,
+                on_conflict: :log
+```
+
+| Strategy | Behavior |
+|----------|----------|
+| `:log` (default) | Log and silently drop the duplicate |
+| `:raise` | Raise an exception |
+| `:reject` | Send to the Sidekiq dead set |
+| `:reschedule` | Delay the duplicate — use with caution, as the lock may not expire before the reschedule fires |

@@ -1,0 +1,262 @@
+---
+title: 'Built-in Conflict Strategy Reference'
+description: 'Detailed behavior, trade-offs, and configuration examples for every built-in on_conflict strategy in sidekiq-unique-jobs, plus how to write custom strategies.'
+keywords: ['sidekiq', 'on_conflict', 'log', 'raise', 'reject', 'replace', 'reschedule', 'custom strategy']
+---
+
+Each conflict strategy is a Ruby class that inherits from `SidekiqUniqueJobs::OnConflict::Strategy` and implements a single `call` method. When a lock acquisition fails, the gem instantiates the configured strategy and calls it, passing the full Sidekiq job hash. The sections below describe exactly what each built-in strategy does and when to reach for it.
+
+---
+
+## `:log`
+
+The `:log` strategy logs an informational message about the duplicate and then discards it. No retry is scheduled, no error is raised, and the job is gone.
+
+This is the **default behavior** when `on_conflict` is not set either globally or on a specific job class.
+
+```ruby
+# lib/sidekiq_unique_jobs/on_conflict/log.rb
+def call
+  log_info(<<~MESSAGE.chomp)
+    Skipping job with id (#{item[JID]}) because lock_digest: (#{item[LOCK_DIGEST]}) already exists
+  MESSAGE
+end
+```
+
+**Configuration:**
+
+```ruby
+class NotificationJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executed, on_conflict: :log
+
+  def perform(user_id)
+    # Duplicate pushes are silently dropped after logging
+  end
+end
+```
+
+**Best for:** Most production use cases where occasional duplicates are expected and dropping them is acceptable. Background sync jobs, cache warming, and periodic reporting jobs are good fits.
+
+---
+
+## `:raise`
+
+The `:raise` strategy raises `SidekiqUniqueJobs::Conflict` when a duplicate is detected. Because `SidekiqUniqueJobs::Conflict` is a subclass of `Sidekiq::Shutdown`, Sidekiq treats it as an interrupted job and places it back on the retry queue according to the worker's `retry` setting.
+
+```ruby
+# lib/sidekiq_unique_jobs/on_conflict/raise.rb
+def call
+  raise SidekiqUniqueJobs::Conflict, item
+end
+```
+
+**Configuration:**
+
+```ruby
+class PaymentJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executed,
+                  on_conflict: :raise,
+                  retry: 5
+
+  def perform(payment_id)
+    # Duplicate attempts raise an error and are retried by Sidekiq
+  end
+end
+```
+
+<Note>
+  `SidekiqUniqueJobs::Conflict` inherits from `SidekiqUniqueJobs::UniqueJobsError`, which is a `RuntimeError`. Sidekiq treats it like any other exception and applies the job's `retry` setting. The job will be retried on Sidekiq's normal backoff schedule and will succeed once the original lock is released.
+</Note>
+
+**Best for:** Jobs where a duplicate indicates a timing issue rather than a bug, and you want the duplicate to eventually execute once the current job finishes. Also useful for surfacing unexpected duplication through Sidekiq's retry visibility.
+
+---
+
+## `:reject`
+
+The `:reject` strategy sends the duplicate job to Sidekiq's **dead set** (also called the morgue). The job is not retried automatically and must be manually re-run or discarded from the Sidekiq Web UI.
+
+```ruby
+# lib/sidekiq_unique_jobs/on_conflict/reject.rb
+def call
+  log_info { "Adding dead #{item[CLASS]} job #{item[JID]}" }
+
+  if kill_with_options?
+    deadset.kill(payload, notify_failure: false)
+  else
+    deadset.kill(payload)
+  end
+end
+```
+
+**Configuration:**
+
+```ruby
+class DataMigrationJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executed, on_conflict: :reject
+
+  def perform(migration_id)
+    # Duplicates land in the dead set for explicit review
+  end
+end
+```
+
+<Warning>
+  Jobs sent to the dead set are **not retried automatically**. They will appear in the **Dead** tab of the Sidekiq Web UI, where they must be manually retried or deleted. Dead jobs are also subject to Sidekiq's dead job TTL (default: 6 months) and dead job count limits (default: 10,000).
+</Warning>
+
+**Best for:** Jobs where a duplicate attempt indicates an unusual condition that requires explicit human review before re-execution — database migrations, billing operations, or any destructive background task.
+
+---
+
+## `:replace`
+
+The `:replace` strategy deletes the **existing** queued job that holds the lock and then enqueues the **new** job in its place. It also removes the stale lock digest from Redis so the new job can acquire the lock cleanly.
+
+```ruby
+# lib/sidekiq_unique_jobs/on_conflict/replace.rb
+def call(&block)
+  return unless (deleted_job = delete_job_by_digest)
+
+  log_info("Deleted job: #{deleted_job}")
+  if (del_count = delete_lock)
+    log_info("Deleted `#{del_count}` keys for #{lock_digest}")
+  end
+
+  block&.call
+end
+```
+
+The strategy searches the queue, the schedule set, and the retry set for a job matching the lock digest. If it finds one, it deletes it and yields to allow the new job to be enqueued.
+
+**Configuration:**
+
+```ruby
+class ProfileSyncJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executing, on_conflict: :replace
+
+  def perform(user_id)
+    # Always run with the freshest arguments
+  end
+end
+```
+
+<Warning>
+  Replace only works when the existing job is **still in the queue** (waiting to be picked up). If the original job has already been dequeued and is currently running on a worker thread, the new job will be dropped because there is no queued entry to delete. In that situation, the `call` method returns early without calling the block.
+</Warning>
+
+**Best for:** Jobs whose arguments evolve over time and you always want the most recent version to run — for example, a user profile sync where a newer event supersedes an earlier one that has not yet been processed.
+
+---
+
+## `:reschedule`
+
+The `:reschedule` strategy schedules the duplicate job to run again in the future by calling `perform_in` on the worker class. The delay defaults to **5 seconds** but can be overridden per worker with the `schedule_in` sidekiq option. A `RESCHEDULED` flag is set on the new job so the client middleware skips the uniqueness check and avoids infinite recursion.
+
+```ruby
+# lib/sidekiq_unique_jobs/on_conflict/reschedule.rb
+def call
+  if sidekiq_job_class?
+    jid = job_class
+      .set(queue: item[QUEUE].to_sym, RESCHEDULED => true)
+      .perform_in(schedule_in, *item[ARGS])
+
+    if jid
+      reflect(:rescheduled, item)
+    else
+      reflect(:reschedule_failed, item)
+    end
+  else
+    reflect(:unknown_sidekiq_worker, item)
+  end
+end
+
+def schedule_in
+  job_class.get_sidekiq_options["schedule_in"] || 5
+end
+```
+
+**Configuration:**
+
+```ruby
+class IndexingJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executed,
+                  on_conflict: :reschedule,
+                  schedule_in: 30   # retry in 30 seconds instead of 5
+
+  def perform(document_id)
+    # If a duplicate arrives while indexing is in progress,
+    # it will be retried 30 seconds from now
+  end
+end
+```
+
+<Note>
+  The rescheduled job is a **new job** with a new JID. It bypasses the uniqueness check on enqueue (via the `RESCHEDULED` flag) and will attempt to acquire the lock normally when it is picked up. If the original job is still running at that point, the new job will conflict again and be rescheduled once more.
+</Note>
+
+**Best for:** Jobs that must eventually execute but can tolerate a delay — search indexing, denormalization, or any job that should run "soon after" the current one completes.
+
+---
+
+## Custom strategies
+
+You can implement a custom conflict strategy by subclassing `SidekiqUniqueJobs::OnConflict::Strategy` and registering it with the configuration.
+
+<Steps>
+  <Step title="Implement the strategy class">
+    Create a class that inherits from `SidekiqUniqueJobs::OnConflict::Strategy` and defines a `call` method. The `item` attribute gives you access to the full Sidekiq job hash.
+
+    ```ruby
+    class MyCustomStrategy < SidekiqUniqueJobs::OnConflict::Strategy
+      def call
+        # item[JID]          => the duplicate job's JID
+        # item['class']      => the worker class name
+        # item['args']       => the job arguments
+        # item[LOCK_DIGEST]  => the Redis digest key that is already locked
+
+        MyMetrics.increment("sidekiq.conflict", tags: { worker: item["class"] })
+        Rails.logger.warn("Duplicate job dropped", jid: item[JID], worker: item["class"])
+      end
+    end
+    ```
+  </Step>
+  <Step title="Register the strategy">
+    Add the strategy to the gem's configuration using `add_strategy`. This will raise `SidekiqUniqueJobs::DuplicateStrategy` if the name is already taken.
+
+    ```ruby
+    SidekiqUniqueJobs.configure do |config|
+      config.add_strategy(:my_custom, MyCustomStrategy)
+    end
+    ```
+  </Step>
+  <Step title="Use the strategy on a worker">
+    Reference the strategy by its registered symbol in `sidekiq_options`:
+
+    ```ruby
+    class BillingJob
+      include Sidekiq::Job
+
+      sidekiq_options lock: :until_executed, on_conflict: :my_custom
+
+      def perform(invoice_id)
+        # Conflicts are handled by MyCustomStrategy#call
+      end
+    end
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+  The `SidekiqUniqueJobs::Logging` and `SidekiqUniqueJobs::Reflectable` modules are available to mix into your custom strategy. `Logging` gives you `log_info` and `log_warn` helpers that respect the gem's logger configuration. `Reflectable` gives you access to `reflect(:event_name, item)` to emit observability events to any registered reflection hooks.
+</Tip>

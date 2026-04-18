@@ -1,0 +1,129 @@
+---
+title: 'until_and_while_executing: Full Lifecycle Lock Protection'
+description: 'Combines enqueue-time and execution-time locks to prevent both duplicate queuing and concurrent execution — the most complete deduplication option in sidekiq-unique-jobs.'
+keywords: ['until_and_while_executing', 'full lock', 'sidekiq deduplication', 'client server lock']
+---
+
+The `:until_and_while_executing` lock is the combination of `:until_executing` and `:while_executing`. It places a client-side lock at enqueue time (preventing any duplicate from sitting in the queue) and a separate server-side lock during execution (preventing concurrent runs). Together they provide complete lifecycle protection: no duplicate can be enqueued while a job is waiting or running.
+
+## When to use it
+
+Use `:until_and_while_executing` when you need both guarantees simultaneously. For example, a billing job that charges a customer should never run twice concurrently, and a second charge should not be queued while the first is still processing. The `:until_executing` lock alone would allow a second charge to start once the first dequeues; `:while_executing` alone would allow many charges to stack in the queue.
+
+<Tip>
+This is the most protective lock type, but it also carries the highest overhead — two distinct Redis lock keys are maintained per job. For most workloads the overhead is negligible, but at very high enqueue rates it is worth profiling before adopting it everywhere.
+</Tip>
+
+## Basic usage
+
+```ruby
+class BillingJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_and_while_executing
+
+  def perform(invoice_id)
+    Invoice.find(invoice_id).charge
+  end
+end
+```
+
+## Per-phase conflict strategies
+
+Because this lock type manages two separate phases, you can configure a different conflict strategy for each:
+
+```ruby
+class BillingJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_and_while_executing,
+                  on_conflict: { client: :log, server: :reschedule }
+
+  def perform(invoice_id)
+    Invoice.find(invoice_id).charge
+  end
+end
+```
+
+This tells the gem to log and drop duplicates at enqueue time, but reschedule any job that tries to execute concurrently — so every job that passes the queue eventually runs, just not at the same time.
+
+## How it works
+
+The implementation in `lib/sidekiq_unique_jobs/lock/until_and_while_executing.rb` shows the two-phase handoff clearly:
+
+```ruby
+# Lock phase — identical to UntilExecuting: locks at enqueue
+def lock(origin: :client, &block)
+  unless (token = locksmith.lock)
+    call_strategy(origin: origin, &block)
+    return
+  end
+
+  yield if block
+  token
+end
+
+# Execute phase — releases the enqueue lock, then acquires a :RUN lock
+def execute
+  if locksmith.unlock
+    runtime_lock.execute { return yield }
+  else
+    reflect(:unlock_failed, item)
+  end
+rescue StandardError
+  reflect(:execution_failed, item)
+  # Re-acquire the until-lock so retries cannot create duplicates
+  locksmith.lock(wait: 0)
+  raise
+end
+
+def runtime_lock
+  @runtime_lock ||= SidekiqUniqueJobs::Lock::WhileExecuting.new(item.dup, callback, redis_pool)
+end
+```
+
+<Steps>
+  <Step title="Client middleware runs at enqueue">
+    The client lock is acquired using the standard job digest. Duplicate enqueues are blocked.
+  </Step>
+  <Step title="Server middleware runs before perform">
+    The client lock is released via `locksmith.unlock`. A new `WhileExecuting` lock (`runtime_lock`) is immediately acquired using the same digest with a `:RUN` suffix.
+  </Step>
+  <Step title="Job executes">
+    The `:RUN` lock is held for the duration of `perform`. Any concurrent attempt to run the same job will hit the server conflict strategy.
+  </Step>
+  <Step title="Job completes">
+    The `:RUN` lock is released. A new identical job can now be enqueued and will proceed through both phases.
+  </Step>
+</Steps>
+
+## Error handling and retries
+
+If `perform` raises, the implementation re-acquires the client lock (`locksmith.lock(wait: 0)`) before re-raising. This ensures that while the failed job is sitting in Sidekiq's retry set, no new duplicate can sneak past the client gate.
+
+```ruby
+rescue StandardError
+  reflect(:execution_failed, item)
+  locksmith.lock(wait: 0)  # re-lock so retries are protected
+  raise
+end
+```
+
+## Conflict strategy reference
+
+| Phase | Strategy | Behavior |
+|-------|----------|----------|
+| Client | `:log` | Log and drop the duplicate enqueue |
+| Client | `:raise` | Raise at enqueue time |
+| Client | `:replace` | Delete the queued job and enqueue the new one |
+| Client | `:reschedule` | Delay the duplicate enqueue |
+| Server | `:log` | Log and drop the concurrent execution attempt |
+| Server | `:reschedule` | Delay the concurrent job so it runs after the current one |
+| Server | `:reject` | Send the concurrent job to the dead set |
+| Server | `:raise` | Raise, triggering Sidekiq's standard retry |
+
+```ruby
+# Use raise on the client to surface bugs, reschedule on the server to ensure execution
+sidekiq_options lock: :until_and_while_executing,
+                on_conflict: { client: :raise, server: :reschedule }
+```

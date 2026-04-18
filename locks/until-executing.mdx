@@ -1,0 +1,95 @@
+---
+title: 'until_executing: Lock Until Job Starts Running'
+description: 'The until_executing lock prevents duplicate jobs from sitting in the Sidekiq queue, but releases before perform runs — allowing concurrent execution.'
+keywords: ['until_executing', 'while_enqueued', 'sidekiq lock', 'prevent duplicate enqueue']
+---
+
+The `:until_executing` lock acquires a Redis lock the moment a job is pushed to Sidekiq and holds it until the job is about to run. As soon as the server middleware dequeues the job and is ready to call `perform`, the lock is released — before execution begins. This means the lock only covers the time a job spends waiting in the queue.
+
+## Aliases
+
+`:while_enqueued` is an alias for `:until_executing` and resolves to the same `SidekiqUniqueJobs::Lock::UntilExecuting` implementation.
+
+## When to use it
+
+Use `:until_executing` when your goal is to avoid stacking up multiple copies of the same job in the queue, but you are comfortable with multiple instances running concurrently. A common example is a job that processes a snapshot of current state: it does not matter if two snapshots run at the same time, but queuing ten identical snapshots wastes resources.
+
+## Basic usage
+
+```ruby
+class SnapshotJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executing
+
+  def perform(account_id)
+    Account.find(account_id).take_snapshot
+  end
+end
+```
+
+Using the alias:
+
+```ruby
+sidekiq_options lock: :while_enqueued
+```
+
+## How it works
+
+The lock implementation in `lib/sidekiq_unique_jobs/lock/until_executing.rb` reflects the two-phase design clearly:
+
+```ruby
+# Lock phase (client middleware — runs at enqueue time)
+def lock(&block)
+  unless (token = locksmith.lock)
+    call_strategy(origin: :client, &block)
+    return
+  end
+
+  yield if block
+  token
+end
+
+# Execute phase (server middleware — runs before perform)
+def execute
+  callback_safely if locksmith.unlock
+  yield
+rescue StandardError => ex
+  reflect(:execution_failed, item, ex)
+  locksmith.lock(wait: 0)
+  raise
+end
+```
+
+Notice that `execute` calls `locksmith.unlock` before yielding. The lock is gone by the time `perform` is invoked. If the job raises an exception, the implementation immediately re-acquires the lock so a retry cannot be enqueued as a duplicate before the original retry runs.
+
+<Warning>
+`:until_executing` does **not** prevent concurrent execution. Once a job is dequeued and its lock is released, a second identical job can be enqueued and also begin running. If you need to prevent concurrent execution, use `:while_executing` or `:until_and_while_executing` instead.
+</Warning>
+
+## Conflict strategies
+
+When a duplicate is pushed while the lock is held, the configured `on_conflict` strategy determines what happens. For `:until_executing`, conflicts occur entirely on the client side.
+
+Recommended strategies:
+
+| Strategy | Behavior |
+|----------|----------|
+| `:log` (default) | Log and silently drop the duplicate |
+| `:raise` | Raise an exception — useful when a duplicate signals a bug |
+| `:replace` | Drop the queued job and enqueue the new one instead |
+| `:reschedule` | Delay the duplicate and retry later |
+
+```ruby
+sidekiq_options lock: :until_executing,
+                on_conflict: :log
+```
+
+## With lock timeout
+
+By default, `lock_timeout` is `0`, meaning the lock attempt gives up immediately if the lock is taken. Set a timeout to make the client wait before calling the conflict strategy:
+
+```ruby
+sidekiq_options lock: :until_executing,
+                lock_timeout: 3  # wait up to 3 seconds before giving up
+```

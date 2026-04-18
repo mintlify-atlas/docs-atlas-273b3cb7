@@ -1,0 +1,76 @@
+---
+title: 'Install sidekiq-unique-jobs in Your Rails App'
+description: 'Step-by-step guide to adding sidekiq-unique-jobs to your Gemfile and registering the client and server middleware in your Sidekiq initializer.'
+keywords: ['sidekiq-unique-jobs', 'installation', 'middleware', 'gemfile', 'initializer']
+---
+
+Installing sidekiq-unique-jobs requires two things: adding the gem to your project and manually registering the middleware with Sidekiq. The gem does not auto-load its middleware — this is intentional, so that you have explicit control over middleware ordering alongside other gems.
+
+## Add the gem
+
+Add sidekiq-unique-jobs to your `Gemfile`:
+
+```ruby Gemfile
+gem "sidekiq-unique-jobs", "~> 9.0"
+```
+
+Then install it:
+
+```bash
+bundle install
+```
+
+## Configure the middleware
+
+Create (or update) `config/initializers/sidekiq.rb` with the following configuration. Both the client middleware and the server middleware must be registered, along with the server lifecycle hooks provided by `SidekiqUniqueJobs::Server.configure`.
+
+```ruby config/initializers/sidekiq.rb
+Sidekiq.configure_client do |config|
+  config.client_middleware do |chain|
+    chain.add SidekiqUniqueJobs::Middleware::Client
+  end
+end
+
+Sidekiq.configure_server do |config|
+  config.client_middleware do |chain|
+    chain.add SidekiqUniqueJobs::Middleware::Client
+  end
+
+  config.server_middleware do |chain|
+    chain.add SidekiqUniqueJobs::Middleware::Server
+  end
+
+  SidekiqUniqueJobs::Server.configure(config)
+end
+```
+
+<Note>
+  The client middleware is registered under **both** `configure_client` and `configure_server`. This is required because the Sidekiq server process also enqueues jobs (for example, when a job re-enqueues itself or schedules a follow-up), and those pushes must go through the lock check as well.
+</Note>
+
+`SidekiqUniqueJobs::Server.configure(config)` wires up three server-side concerns:
+
+- **Startup**: runs the lock migration from v8, starts the orphan reaper, and initializes metrics.
+- **Shutdown**: flushes metrics and releases the reaper mutex cleanly.
+- **Death handler**: deletes the lock digest when a job is moved to the dead set by Sidekiq's built-in death handling.
+
+## Middleware ordering
+
+<Warning>
+  Since v7, the middleware is **not** auto-loaded. If you upgrade from an older version and your initializer is missing, uniqueness will not be enforced.
+</Warning>
+
+When using sidekiq-unique-jobs alongside other middleware gems, the order of `chain.add` calls matters. As a general rule, add `SidekiqUniqueJobs::Middleware::Client` **last** in the client chain and `SidekiqUniqueJobs::Middleware::Server` **last** in the server chain. This ensures that gems like `apartment-sidekiq` or `sidekiq-global_id` have already set up their context before the uniqueness lock is evaluated.
+
+```ruby config/initializers/sidekiq.rb
+Sidekiq.configure_client do |config|
+  config.client_middleware do |chain|
+    chain.add ApartmentJobsMiddleware          # other gem first
+    chain.add SidekiqUniqueJobs::Middleware::Client  # unique jobs last
+  end
+end
+```
+
+<Tip>
+  Use `Sidekiq.client_middleware.entries.map(&:klass)` in a Rails console to inspect the current middleware order at runtime.
+</Tip>

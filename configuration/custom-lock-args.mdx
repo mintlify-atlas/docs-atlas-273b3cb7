@@ -1,0 +1,158 @@
+---
+title: 'Customizing Lock Arguments for Job Uniqueness'
+description: 'Filter which job arguments contribute to the Redis lock digest, so transient parameters like timestamps or request IDs never break deduplication.'
+keywords: ['lock_args', 'lock_args_method', 'unique_args', 'lock digest', 'sidekiq uniqueness', 'unique_across_queues', 'unique_across_workers']
+---
+
+By default, sidekiq-unique-jobs builds a lock digest from three components: the worker class name, the queue, and every argument passed to `perform_async`. Two jobs are considered duplicates only when all three components match. This default works well for most jobs, but breaks down when some arguments are inherently transient — for example, a `requested_at` timestamp, a correlation ID, or a random nonce. Customizing lock arguments lets you tell the gem which parts of the argument list actually determine uniqueness and which parts should be ignored.
+
+## How the digest is computed
+
+```ruby
+# These two calls produce different digests with default settings:
+MyJob.perform_async(user_id: 42, timestamp: Time.now.to_i)
+MyJob.perform_async(user_id: 42, timestamp: Time.now.to_i + 1)
+
+# With a custom lock_args_method that keeps only user_id,
+# both calls produce the same digest and the second is a duplicate.
+```
+
+## Three ways to customize lock arguments
+
+### 1. Define `self.lock_args` on the worker class
+
+The simplest approach. If the gem finds a class method named `lock_args` on the worker, it calls that method automatically — no additional `sidekiq_options` entry is needed.
+
+```ruby
+class NotificationJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executed
+
+  def self.lock_args(args)
+    # args is the full array passed to perform_async.
+    # Return only the elements that determine uniqueness.
+    [args.first]  # keep only user_id
+  end
+
+  def perform(user_id, correlation_id)
+    # correlation_id is excluded from the digest
+    User.find(user_id).send_notification
+  end
+end
+```
+
+### 2. Point `lock_args_method` to a named class method
+
+Use this when you want an explicit declaration in `sidekiq_options` or when the method name differs from `lock_args`.
+
+```ruby
+class ReportJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executed,
+                  lock_args_method: :unique_args
+
+  def self.unique_args(args)
+    # Only the report type and date range determine uniqueness.
+    # The requesting user's ID is excluded.
+    [args[0], args[1]]  # [report_type, date_range]
+  end
+
+  def perform(report_type, date_range, requested_by_user_id)
+    Report.generate(report_type, date_range)
+  end
+end
+```
+
+### 3. Use an inline lambda
+
+Inline lambdas are convenient for simple filters that do not need a named method. The lambda receives the full args array and must return an array.
+
+```ruby
+class SyncJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executed,
+                  lock_args_method: ->(args) { [args.first] }
+
+  def perform(record_id, synced_at)
+    Record.find(record_id).sync
+  end
+end
+```
+
+<Warning>
+  Returning an empty array `[]` makes every job of that type share the same digest, regardless of arguments. This means only one job can be enqueued or running at a time across your entire application — all subsequent calls are treated as duplicates. Only return `[]` if that is the intended behavior.
+</Warning>
+
+## Ignoring queue and worker class
+
+Two additional options broaden what counts as a duplicate without changing the argument filter.
+
+### `unique_across_queues`
+
+Excludes the queue name from the digest. Jobs with matching arguments are considered duplicates even if they target different queues.
+
+```ruby
+sidekiq_options lock: :until_executed,
+                unique_across_queues: true
+```
+
+Use this when you route the same job class to multiple queues (for example, `critical` and `default`) and want to prevent a job from being enqueued on both simultaneously.
+
+### `unique_across_workers`
+
+Excludes the worker class name from the digest. Two different worker classes with the same queue and arguments share a lock.
+
+```ruby
+sidekiq_options lock: :until_executed,
+                unique_across_workers: true
+```
+
+This is rarely needed. Use it only when multiple worker classes are intentionally interchangeable and you want the lock to cover all of them.
+
+## Combining filters
+
+You can combine `lock_args_method` with `unique_across_queues` and `unique_across_workers` to build a precise uniqueness scope.
+
+```ruby
+class EmailJob
+  include Sidekiq::Job
+
+  sidekiq_options lock:                 :until_executed,
+                  lock_args_method:     ->(args) { [args[0]] },
+                  unique_across_queues: true
+
+  def perform(recipient_id, template_name)
+    # Only recipient_id matters for uniqueness,
+    # and queue does not matter either.
+    Mailer.deliver(recipient_id, template_name)
+  end
+end
+```
+
+## Debugging digest issues
+
+When uniqueness is not behaving as expected, enable `lock_info` in the global configuration to store digest metadata in Redis alongside each lock:
+
+```ruby
+SidekiqUniqueJobs.configure do |config|
+  config.lock_info = true
+end
+```
+
+With `lock_info` enabled, you can inspect the Sidekiq Web UI **Locks** tab to see exactly which arguments were used to compute each digest. Disable this setting in production after you have finished debugging — it adds a small overhead to every lock operation.
+
+<Tip>
+  A common debugging technique is to call `SidekiqUniqueJobs::LockArgs.call(job_hash)` directly in a Rails console. Pass a synthetic job hash with the class name, queue, and args you want to inspect, and the method returns the filtered args array that will be hashed into the digest.
+
+  ```ruby
+  SidekiqUniqueJobs::LockArgs.call(
+    "class" => "NotificationJob",
+    "queue" => "default",
+    "args"  => [42, "abc-correlation-id"]
+  )
+  # => [42]  (only user_id, because lock_args filters out the correlation_id)
+  ```
+</Tip>

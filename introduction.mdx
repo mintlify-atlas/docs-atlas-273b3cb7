@@ -1,0 +1,61 @@
+---
+title: 'sidekiq-unique-jobs: Prevent Duplicate Sidekiq Jobs'
+description: 'Learn how sidekiq-unique-jobs uses Redis locks to eliminate duplicate background jobs, with an overview of lock types, conflict strategies, and middleware.'
+keywords: ['sidekiq', 'unique jobs', 'redis locks', 'duplicate jobs', 'background jobs']
+---
+
+sidekiq-unique-jobs is a Sidekiq middleware gem that prevents duplicate jobs from being enqueued or executed. It acquires a Redis lock when a job is pushed to a queue and releases that lock at a configurable point in the job lifecycle — ensuring that only one job with the same arguments can exist in the system at any given time.
+
+## Why use it
+
+Without uniqueness enforcement, background job queues can accumulate redundant work. A webhook handler that fires multiple times, a scheduled job that re-enqueues before the previous run finishes, or a user action that triggers the same job in quick succession — all of these create duplicate jobs that waste resources and can produce inconsistent results. sidekiq-unique-jobs solves this by making each combination of worker class, queue, and arguments globally unique within Redis for the duration you choose.
+
+## Key concepts
+
+### Lock types
+
+A lock type determines when the Redis lock is acquired and when it is released. Different workflows call for different lock boundaries. For example, `:until_executing` prevents re-enqueuing the same job but allows a new one to be pushed as soon as the existing job starts running. `:until_executed` keeps the lock held until the job completes successfully, giving you full lifecycle protection.
+
+| Lock type | Acquires at | Releases at | Typical use case |
+|---|---|---|---|
+| `:until_executing` | Enqueue | Before perform | Prevent duplicate enqueuing |
+| `:until_executed` | Enqueue | After perform | Prevent duplicates until job completes |
+| `:until_expired` | Enqueue | TTL expiry | Time-based uniqueness (e.g. daily jobs) |
+| `:while_executing` | Perform | After perform | Prevent concurrent execution |
+| `:until_and_while_executing` | Enqueue + Perform | Before + After perform | Full lifecycle protection |
+
+### Conflict strategies
+
+When a duplicate job is detected, a conflict strategy decides what happens to it. The default strategy logs the duplicate and discards it silently. Other strategies let you raise an exception to trigger a retry, send the job to the dead set, replace the existing job with the new one, or reschedule the duplicate for a later attempt.
+
+### Middleware
+
+sidekiq-unique-jobs works through two Sidekiq middleware classes:
+
+- `SidekiqUniqueJobs::Middleware::Client` — intercepts job pushes and acquires the lock before the job enters the queue
+- `SidekiqUniqueJobs::Middleware::Server` — intercepts job execution and manages lock release according to the configured lock type
+
+Both must be registered manually in your Sidekiq initializer. The gem also exposes `SidekiqUniqueJobs::Server.configure` to wire up startup and shutdown hooks (reaper, metrics, crash recovery).
+
+## Requirements
+
+- Ruby >= 3.2
+- Sidekiq >= 8.0
+- Redis >= 6.2 (required for `LMOVE` support)
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="package" href="/installation">
+    Add the gem to your project and configure the middleware in your Sidekiq initializer.
+  </Card>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Get a uniqueness-protected job running in under five minutes.
+  </Card>
+  <Card title="Lock types" icon="lock" href="/locks/overview">
+    Understand each lock type and choose the right one for your use case.
+  </Card>
+  <Card title="Conflict strategies" icon="shuffle" href="/conflict/overview">
+    Control what happens when a duplicate job is detected at enqueue or execution time.
+  </Card>
+</CardGroup>

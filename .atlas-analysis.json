@@ -1,0 +1,106 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "sidekiq-unique-jobs",
+  "projectDescription": "A Ruby gem that prevents duplicate Sidekiq jobs by using Redis locks to enforce uniqueness based on configurable job arguments and lifecycle strategies.",
+  "theme": "luma",
+  "primaryColor": "#41b1f8",
+  "lightColor": "#042b93",
+  "darkColor": "#cee4f4",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Lock Types",
+            "pages": [
+              "locks/overview",
+              "locks/until-executing",
+              "locks/until-executed",
+              "locks/until-expired",
+              "locks/while-executing",
+              "locks/until-and-while-executing"
+            ]
+          },
+          {
+            "group": "Conflict Strategies",
+            "pages": [
+              "conflict/overview",
+              "conflict/strategies"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/global",
+              "configuration/per-job",
+              "configuration/custom-lock-args"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/reliable-fetch",
+              "advanced/reflections",
+              "advanced/orphan-reaper",
+              "advanced/web-ui",
+              "advanced/testing",
+              "advanced/upgrading"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multiple lock types covering the full job lifecycle (enqueue, execute, expiry)",
+    "Configurable conflict strategies: log, raise, reject, replace, reschedule",
+    "Custom lock arguments to control which job parameters determine uniqueness",
+    "Reflection/observability hooks for lock lifecycle events",
+    "Orphan lock reaper (Ruby and Lua implementations) for crash recovery",
+    "ReliableFetch strategy with atomic LMOVE and lock-aware acknowledgment",
+    "Sidekiq Web UI extension to browse, filter, and delete locks",
+    "CLI tool (uniquejobs) for managing locks from the command line",
+    "Thread-safe configuration with per-job overrides",
+    "FIPS-compatible modern digest algorithm option"
+  ],
+  "publicApiSurface": [
+    "SidekiqUniqueJobs::Middleware::Client",
+    "SidekiqUniqueJobs::Middleware::Server",
+    "SidekiqUniqueJobs.configure { |config| ... }",
+    "SidekiqUniqueJobs.reflect { |on| ... }",
+    "SidekiqUniqueJobs::Fetch::Reliable",
+    "SidekiqUniqueJobs::Server.configure(config)",
+    "sidekiq_options lock: :until_executed",
+    "sidekiq_options on_conflict: :reject",
+    "sidekiq_options lock_args_method: ->(args) { ... }",
+    "sidekiq_options lock_ttl: 3600",
+    "sidekiq_options lock_timeout: 0",
+    "sidekiq_options unique_across_queues: true",
+    "sidekiq_options unique_across_workers: true",
+    "SidekiqUniqueJobs::Lock::UntilExecuting",
+    "SidekiqUniqueJobs::Lock::UntilExecuted",
+    "SidekiqUniqueJobs::Lock::UntilExpired",
+    "SidekiqUniqueJobs::Lock::WhileExecuting",
+    "SidekiqUniqueJobs::Lock::WhileExecutingReject",
+    "SidekiqUniqueJobs::Lock::UntilAndWhileExecuting",
+    "SidekiqUniqueJobs::OnConflict::Log",
+    "SidekiqUniqueJobs::OnConflict::Raise",
+    "SidekiqUniqueJobs::OnConflict::Reject",
+    "SidekiqUniqueJobs::OnConflict::Replace",
+    "SidekiqUniqueJobs::OnConflict::Reschedule",
+    "SidekiqUniqueJobs::Config#add_lock(name, klass)",
+    "SidekiqUniqueJobs::Config#add_strategy(name, klass)",
+    "uniquejobs list PATTERN",
+    "uniquejobs del PATTERN",
+    "uniquejobs console"
+  ]
+}

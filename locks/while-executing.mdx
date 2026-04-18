@@ -1,0 +1,125 @@
+---
+title: 'while_executing: Lock Only During Job Execution'
+description: 'The while_executing lock prevents concurrent execution of the same job without restricting how many copies can queue up — and includes a reject variant.'
+keywords: ['while_executing', 'around_perform', 'concurrent execution', 'sidekiq server lock']
+---
+
+The `:while_executing` lock is a server-only lock. It does not interact with the client middleware at enqueue time — any number of identical jobs can be pushed to the queue and sit there waiting. The lock is only acquired immediately before `perform` is called, and released as soon as `perform` returns or raises. This prevents two workers from running the same job concurrently while allowing duplicates to queue freely.
+
+## Aliases
+
+The following aliases all resolve to `SidekiqUniqueJobs::Lock::WhileExecuting`:
+
+- `:around_perform`
+- `:while_busy`
+- `:while_working`
+
+## When to use it
+
+Use `:while_executing` when concurrent execution is the problem — not duplicate queuing. For example, a job that holds a shared resource (a file, an external API session, a hardware interface) should not run in parallel with itself, but you may be fine with multiple enqueues stacking up so they all eventually run in sequence.
+
+<Warning>
+`:while_executing` does **not** prevent duplicate jobs from being enqueued. If `perform_async` is called ten times with the same arguments, ten copies will sit in the queue. They will execute one at a time, but all ten will run. If you need to prevent duplicate queuing as well, use `:until_and_while_executing`.
+</Warning>
+
+## Basic usage
+
+```ruby
+class ExportJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :while_executing
+
+  def perform(export_id)
+    Export.find(export_id).run
+  end
+end
+```
+
+Using an alias:
+
+```ruby
+sidekiq_options lock: :around_perform
+```
+
+## How it works
+
+The `:while_executing` implementation appends a `:RUN` suffix to the lock digest so it uses a separate Redis key from any client-side lock. The `lock` method always returns the job ID (simulating success) because there is no client-side gate:
+
+```ruby
+# Lock phase — always succeeds, no client gate
+def lock
+  job_id = item[JID]
+  yield if block_given?
+  job_id
+end
+
+# Execute phase — acquires the RUN lock, yields, then unlocks
+def execute(&block)
+  with_logging_context do
+    executed = locksmith.execute do
+      yield
+      item[JID]
+    ensure
+      unlock_and_callback
+    end
+
+    unless executed
+      reflect(:execution_failed, item)
+      call_strategy(origin: :server, &block)
+    end
+  end
+end
+```
+
+If `locksmith.execute` cannot acquire the `:RUN` lock (because another worker is already executing), the server conflict strategy is invoked.
+
+## while_executing_reject
+
+`:while_executing_reject` is a variant that hardcodes the `:reject` conflict strategy on the server side. When a concurrent execution is detected, the duplicate job is sent to the Sidekiq dead set rather than being rescheduled or logged:
+
+```ruby
+class CriticalJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :while_executing_reject
+
+  def perform(resource_id)
+    Resource.find(resource_id).process
+  end
+end
+```
+
+This is equivalent to:
+
+```ruby
+sidekiq_options lock: :while_executing,
+                on_conflict: { server: :reject }
+```
+
+## Server conflict strategies
+
+When a second worker tries to run a job while the lock is held, the `on_conflict` server strategy applies:
+
+| Strategy | Behavior |
+|----------|----------|
+| `:log` (default) | Log and discard the concurrent attempt |
+| `:reschedule` | Delay and retry — the job will run after the current one finishes |
+| `:reject` | Send to dead set |
+| `:raise` | Raise an exception, triggering Sidekiq's standard retry |
+
+```ruby
+sidekiq_options lock: :while_executing,
+                on_conflict: { server: :reschedule }
+```
+
+## Comparison with :until_and_while_executing
+
+| | `:while_executing` | `:until_and_while_executing` |
+|-|-------------------|------------------------------|
+| Prevents duplicate queuing | No | Yes |
+| Prevents concurrent execution | Yes | Yes |
+| Lock acquired at | Perform | Enqueue + Perform |
+| Overhead | Lower | Higher |
+
+If you need both guarantees, use `:until_and_while_executing`. See the [Until and While Executing](/locks/until-and-while-executing) page for details.

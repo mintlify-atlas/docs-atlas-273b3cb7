@@ -1,0 +1,224 @@
+---
+title: 'Observing Lock Events with Reflections'
+description: 'Subscribe to 14 named lock lifecycle events to collect metrics, emit structured logs, and trigger alerts without modifying gem behavior.'
+keywords: ['reflections', 'observability', 'lock events', 'metrics', 'hooks', 'sidekiq-unique-jobs']
+---
+
+sidekiq-unique-jobs does not emit logs by default. Instead, it exposes a structured reflection system that fires named callbacks at key points in the lock lifecycle. You subscribe to the events you care about and decide what to do with them — write a log line, increment a counter, send a trace span, or raise an alert. Nothing you register changes how the gem behaves; reflections are purely observational.
+
+## Subscribing to reflections
+
+Call `SidekiqUniqueJobs.reflect` once during application boot, typically in the same initializer where you configure Sidekiq:
+
+```ruby
+# config/initializers/sidekiq.rb
+SidekiqUniqueJobs.reflect do |on|
+  on.locked do |job|
+    # called when a lock is successfully acquired
+  end
+
+  on.lock_failed do |job|
+    # called when a lock could not be acquired
+  end
+end
+```
+
+Each callback receives a `job` hash — the raw Sidekiq job payload — with keys like `"class"`, `"jid"`, `"queue"`, and `"args"`. Some callbacks receive additional arguments; see the reference below.
+
+You do not need to configure all reflections. Subscribe only to the events that matter to your monitoring setup.
+
+## All 14 reflection points
+
+<AccordionGroup>
+  <Accordion title="locked">
+    Fired when the gem successfully acquires a lock. Use this to count successful lock acquisitions or to trace lock ownership.
+
+    ```ruby
+    on.locked do |job|
+      StatsD.increment("sidekiq.locks.acquired", tags: ["worker:#{job['class']}"])
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="unlocked">
+    Fired when a lock is successfully released. Pairs with `locked` to measure lock duration when combined with a timestamp recorded in the `locked` callback.
+
+    ```ruby
+    on.unlocked do |job|
+      StatsD.increment("sidekiq.locks.released", tags: ["worker:#{job['class']}"])
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="lock_failed">
+    Fired when the gem cannot acquire a lock because it is already held. This is the normal signal for a duplicate job. Use it to count how often duplicates are detected.
+
+    ```ruby
+    on.lock_failed do |job|
+      logger.warn("Duplicate dropped: #{job['class']} args=#{job['args'].inspect}")
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="unlock_failed">
+    Fired when lock release fails — typically because the lock entry was already gone (expired TTL, manual deletion, or a race condition). Worth logging at warn level; it usually indicates a configuration issue.
+
+    ```ruby
+    on.unlock_failed do |job|
+      logger.warn("Unlock failed: #{job['class']} jid=#{job['jid']}")
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="duplicate">
+    Fired specifically when a job is identified as a duplicate during enqueue (client-side). Distinct from `lock_failed` which also fires on the server side.
+
+    ```ruby
+    on.duplicate do |job|
+      logger.info("Duplicate enqueue suppressed: #{job['class']}")
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="execution_failed">
+    Fired when an error occurs during job execution and the gem catches it to provide this reflection. Receives both the job hash and the exception.
+
+    ```ruby
+    on.execution_failed do |job, exception|
+      Sentry.capture_exception(exception, extra: { job: job['class'], jid: job['jid'] })
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="reschedule_failed">
+    Fired when the `:reschedule` conflict strategy attempts to reschedule a duplicate job but the reschedule operation itself fails.
+
+    ```ruby
+    on.reschedule_failed do |job|
+      logger.error("Reschedule failed: #{job['class']} jid=#{job['jid']}")
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="rescheduled">
+    Fired when the `:reschedule` conflict strategy successfully delays a duplicate job. Use this to track how often rescheduling is triggered.
+
+    ```ruby
+    on.rescheduled do |job|
+      StatsD.increment("sidekiq.locks.rescheduled", tags: ["worker:#{job['class']}"])
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="timeout">
+    Fired when `lock_timeout` is set to a positive value and the gem gives up waiting for the lock. The job did not execute.
+
+    ```ruby
+    on.timeout do |job|
+      logger.warn("Lock timeout: #{job['class']} waited #{job['lock_timeout']}s")
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="unknown_sidekiq_worker">
+    Fired when the gem encounters a job whose worker class is not defined in the current process. Common in environments where workers are split across multiple processes with different job classes loaded.
+
+    ```ruby
+    on.unknown_sidekiq_worker do |job|
+      logger.warn("Unknown worker class: #{job['class']}")
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="after_unlock_callback_failed">
+    Fired when a worker defines an `after_unlock` callback and that callback raises an exception. The unlock itself has already succeeded; only the callback failed.
+
+    ```ruby
+    on.after_unlock_callback_failed do |job|
+      logger.error("after_unlock callback failed: #{job['class']}")
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="uniqueness_lapsed">
+    Fired when a job is fetched but its lock entry is no longer present in Redis — typically because the lock expired via TTL before the job was executed. The job still runs; this is an informational signal.
+
+    ```ruby
+    on.uniqueness_lapsed do |job|
+      logger.warn("Lock expired before execution: #{job['class']} jid=#{job['jid']}")
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="error">
+    General-purpose error reflection fired when the gem catches an unexpected internal error. Use this as a catch-all alert.
+
+    ```ruby
+    on.error do |job, exception|
+      Sentry.capture_exception(exception, extra: { job: job })
+    end
+    ```
+  </Accordion>
+
+  <Accordion title="debug">
+    Low-level diagnostic reflection fired during internal operations. Useful during troubleshooting but verbose enough to leave off in production.
+
+    ```ruby
+    on.debug do |job|
+      logger.debug("sidekiq-unique-jobs debug: #{job.inspect}")
+    end
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Real-world example: metrics integration
+
+The following example shows a complete reflection setup that sends lock metrics to StatsD, routes errors to Sentry, and writes structured log lines for operational events:
+
+```ruby
+# config/initializers/sidekiq.rb
+SidekiqUniqueJobs.reflect do |on|
+  on.locked do |job|
+    StatsD.increment("sidekiq.lock.acquired", tags: ["worker:#{job['class']}"])
+  end
+
+  on.unlocked do |job|
+    StatsD.increment("sidekiq.lock.released", tags: ["worker:#{job['class']}"])
+  end
+
+  on.lock_failed do |job|
+    StatsD.increment("sidekiq.lock.duplicate", tags: ["worker:#{job['class']}"])
+    Rails.logger.info("[unique_jobs] duplicate dropped class=#{job['class']} jid=#{job['jid']}")
+  end
+
+  on.timeout do |job|
+    StatsD.increment("sidekiq.lock.timeout", tags: ["worker:#{job['class']}"])
+    Rails.logger.warn("[unique_jobs] lock timeout class=#{job['class']}")
+  end
+
+  on.execution_failed do |job, exception|
+    Sentry.capture_exception(
+      exception,
+      extra: { worker: job["class"], jid: job["jid"], queue: job["queue"] },
+    )
+  end
+
+  on.unlock_failed do |job|
+    Rails.logger.warn("[unique_jobs] unlock failed class=#{job['class']} jid=#{job['jid']}")
+  end
+
+  on.after_unlock_callback_failed do |job|
+    Rails.logger.error("[unique_jobs] after_unlock callback failed class=#{job['class']}")
+  end
+end
+```
+
+<Tip>
+  Start with `lock_failed`, `timeout`, and `execution_failed`. Those three cover the most actionable events. Add the rest incrementally as you identify monitoring gaps.
+</Tip>
+
+## Notes
+
+- Each reflection name maps to exactly one block. Calling `on.locked` twice replaces the first block with the second.
+- An `on.error` subscription is independent of `on.execution_failed`. The `error` reflection fires for internal gem errors; `execution_failed` fires for errors in your job code.
+- Reflection blocks are called synchronously in the same thread as the job operation. Keep them fast. Offload expensive operations (HTTP calls, disk writes) to a background queue or an async-safe metrics client.

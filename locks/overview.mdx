@@ -1,0 +1,92 @@
+---
+title: 'Lock Types: A Complete Guide to sidekiq-unique-jobs'
+description: 'Compare all five lock types in sidekiq-unique-jobs and learn how each controls job uniqueness across enqueue and execution phases.'
+keywords: ['sidekiq-unique-jobs', 'lock types', 'unique jobs', 'deduplication', 'redis locks']
+---
+
+Every sidekiq-unique-jobs lock is backed by a Redis key that tracks whether a given job (identified by its digest) is allowed to proceed. The lock lifecycle has two distinct moments: when a job is pushed to Redis (the client phase) and when a worker begins executing it (the server phase). Choosing the right lock type means deciding at which of those moments the lock is acquired, and at which it is released.
+
+## How lock lifecycle works
+
+When the Sidekiq client middleware runs — whether from `perform_async`, `perform_in`, or a server-side re-enqueue — it checks whether a lock already exists for the job digest. If the lock is taken and the current strategy is to skip, the job is dropped. If the lock is free, it is acquired and the job proceeds into the queue.
+
+On the server side, the Sidekiq server middleware runs before `perform`. Depending on the lock type, the lock may be released here (before execution), held through execution and released after, or held entirely by Redis TTL and never explicitly released by the server at all.
+
+## Lock type comparison
+
+| Type | Locks at | Unlocks at | Use case |
+|------|----------|------------|----------|
+| `:until_executing` | Enqueue | Before `perform` | Prevent duplicate enqueuing while a job waits in the queue |
+| `:until_executed` | Enqueue | After `perform` | Prevent any duplicate from the moment of push until the job completes |
+| `:until_expired` | Enqueue | TTL expiry | Time-based uniqueness — the lock lives for a fixed duration regardless of execution |
+| `:while_executing` | `perform` | After `perform` | Prevent concurrent execution while allowing duplicates to queue up |
+| `:until_and_while_executing` | Enqueue + `perform` | Before + after `perform` | Full lifecycle protection — no duplicate queuing and no concurrent execution |
+
+## Setting a lock on a job
+
+Add `lock:` to your worker's `sidekiq_options`. All other options are optional.
+
+```ruby
+class ReportJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executed
+
+  def perform(report_id)
+    # ...
+  end
+end
+```
+
+You can also configure a conflict strategy, a lock TTL, a timeout, and per-phase conflict handling:
+
+```ruby
+class ReportJob
+  include Sidekiq::Job
+
+  sidekiq_options lock: :until_executed,
+                  lock_ttl: 600,
+                  lock_timeout: 5,
+                  on_conflict: { client: :log, server: :reschedule }
+
+  def perform(report_id)
+    # ...
+  end
+end
+```
+
+## Lock type aliases
+
+The following aliases are registered in `SidekiqUniqueJobs::Config` and resolve to the same implementation as their canonical name:
+
+| Alias | Resolves to |
+|-------|-------------|
+| `:while_enqueued` | `:until_executing` |
+| `:until_completed` | `:until_executed` |
+| `:until_performed` | `:until_executed` |
+| `:until_processed` | `:until_executed` |
+| `:until_successfully_completed` | `:until_executed` |
+| `:around_perform` | `:while_executing` |
+| `:while_busy` | `:while_executing` |
+| `:while_working` | `:while_executing` |
+| `:while_executing_reject` | `:while_executing` (with forced reject strategy) |
+
+## Lock type pages
+
+<CardGroup cols={2}>
+  <Card title="Until Executing" icon="clock" href="/locks/until-executing">
+    Locks at enqueue, releases before the job starts. Prevents duplicate queuing.
+  </Card>
+  <Card title="Until Executed" icon="circle-check" href="/locks/until-executed">
+    Locks at enqueue, releases after the job completes. The most common general-purpose lock.
+  </Card>
+  <Card title="Until Expired" icon="hourglass" href="/locks/until-expired">
+    Locks at enqueue, releases when a TTL expires. Use for time-windowed uniqueness.
+  </Card>
+  <Card title="While Executing" icon="bolt" href="/locks/while-executing">
+    Locks only during execution. Prevents concurrent runs without blocking the queue.
+  </Card>
+  <Card title="Until and While Executing" icon="shield" href="/locks/until-and-while-executing">
+    Combines enqueue and execution locks for full lifecycle protection.
+  </Card>
+</CardGroup>

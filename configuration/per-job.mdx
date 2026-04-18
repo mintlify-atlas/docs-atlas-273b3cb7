@@ -1,0 +1,112 @@
+---
+title: 'Per-Job Options for sidekiq-unique-jobs'
+description: 'Configure lock type, conflict strategy, TTL, timeout, and argument filtering individually for each Sidekiq worker using sidekiq_options.'
+keywords: ['sidekiq_options', 'lock', 'on_conflict', 'lock_ttl', 'lock_timeout', 'lock_args_method', 'unique_across_queues', 'unique_across_workers']
+---
+
+Per-job options are set using `sidekiq_options` directly on the worker class. They take precedence over any matching global defaults set in `SidekiqUniqueJobs.configure`. Only `lock` is required — all other options are optional and fall back to the global configuration or their built-in defaults when omitted.
+
+## Options
+
+<ParamField path="lock" type="symbol" required>
+  The lock strategy to use for this worker. This is the only required option; without it, the gem does not apply any uniqueness enforcement to the job. See the [lock types overview](/locks/overview) for the full list of available strategies and when to use each one.
+
+  ```ruby
+  sidekiq_options lock: :until_executed
+  ```
+</ParamField>
+
+<ParamField path="on_conflict" type="symbol | hash">
+  What to do when a duplicate job is detected and the lock cannot be acquired. Accepts either a single symbol that applies to both the client (enqueue) and server (execute) phases, or a hash that sets each phase independently.
+
+  Accepted symbols: `:log`, `:raise`, `:reject`, `:replace`, `:reschedule`, or any custom strategy registered via `add_strategy`.
+
+  ```ruby
+  # Same strategy for both phases
+  sidekiq_options lock: :until_executed, on_conflict: :reschedule
+
+  # Different strategies per phase
+  sidekiq_options lock: :until_and_while_executing,
+                  on_conflict: { client: :log, server: :reschedule }
+  ```
+</ParamField>
+
+<ParamField path="lock_timeout" type="integer" default="0">
+  Number of seconds to wait when attempting to acquire a lock that is already held. `0` means give up immediately and invoke the conflict strategy. A positive integer causes the enqueue or execute phase to block for up to that many seconds before giving up.
+
+  ```ruby
+  sidekiq_options lock: :until_executed, lock_timeout: 10
+  ```
+</ParamField>
+
+<ParamField path="lock_ttl" type="integer" default="nil">
+  Number of seconds after which the lock expires automatically in Redis. When `nil`, the lock is held until the gem releases it. Setting a TTL is useful as a safety net against locks that are never released due to a crashed worker process, or for time-bounded uniqueness windows.
+
+  ```ruby
+  sidekiq_options lock: :until_expired, lock_ttl: 86400  # 24-hour uniqueness window
+  ```
+
+  <Warning>
+    The TTL starts from when the lock is created, not from when the job begins executing. If your job's runtime can approach or exceed `lock_ttl`, size the TTL generously or the lock may expire before the job finishes, allowing duplicates to slip through.
+  </Warning>
+</ParamField>
+
+<ParamField path="lock_args_method" type="symbol | proc">
+  Customizes which arguments are included in the lock digest. By default, the digest is computed from the worker class name, queue, and all job arguments. Use this option to ignore transient parameters — such as timestamps or request IDs — that should not affect uniqueness.
+
+  Accepts a symbol naming a class method on the worker, or a lambda that receives the full args array and returns the subset to use.
+
+  ```ruby
+  # Symbol pointing to a class method
+  sidekiq_options lock: :until_executed, lock_args_method: :unique_args
+
+  # Inline lambda
+  sidekiq_options lock: :until_executed,
+                  lock_args_method: ->(args) { [args.first] }
+  ```
+
+  See [Customizing lock arguments](/configuration/custom-lock-args) for full details and examples.
+</ParamField>
+
+<ParamField path="unique_across_queues" type="boolean" default="false">
+  When `true`, the queue name is excluded from the lock digest. A job enqueued on `critical` and the same job enqueued on `default` with identical arguments are treated as duplicates of each other.
+
+  ```ruby
+  sidekiq_options lock: :until_executed, unique_across_queues: true
+  ```
+</ParamField>
+
+<ParamField path="unique_across_workers" type="boolean" default="false">
+  When `true`, the worker class name is excluded from the lock digest. Two different worker classes with the same queue and identical arguments are treated as duplicates of each other. Use with care — this is rarely needed and can cause unexpected lock collisions between unrelated workers.
+
+  ```ruby
+  sidekiq_options lock: :until_executed, unique_across_workers: true
+  ```
+</ParamField>
+
+## Full example
+
+```ruby
+class ReportGenerationJob
+  include Sidekiq::Job
+
+  sidekiq_options lock:                 :until_and_while_executing,
+                  on_conflict:          { client: :log, server: :reschedule },
+                  lock_timeout:         5,
+                  lock_ttl:             7200,
+                  lock_args_method:     ->(args) { [args.first] },
+                  unique_across_queues: true
+
+  def perform(report_id, requested_at)
+    # Only `report_id` determines uniqueness — `requested_at` is ignored.
+    # A duplicate enqueued while one is waiting is logged and discarded.
+    # A duplicate arriving while one is running is rescheduled 5 seconds later.
+    # The lock expires after 2 hours regardless of job state.
+    Report.generate(report_id)
+  end
+end
+```
+
+<Note>
+  Per-job options always take precedence over global defaults. If you set `on_conflict: :raise` globally but `on_conflict: :log` on a specific worker, that worker uses `:log`.
+</Note>

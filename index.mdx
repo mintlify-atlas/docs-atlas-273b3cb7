@@ -1,97 +1,75 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "sidekiq-unique-jobs: Prevent Duplicate Sidekiq Jobs"
+description: "sidekiq-unique-jobs is a Ruby gem that prevents duplicate Sidekiq jobs using Redis locks. Highly configurable lock types and conflict strategies."
 ---
 
-## Setting up
+sidekiq-unique-jobs is a Sidekiq middleware gem that uses Redis locks to ensure only one copy of a job with the same arguments runs at a time. Whether you need to prevent duplicate enqueuing, duplicate execution, or both, this gem provides the tools to enforce job uniqueness throughout the entire lifecycle.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get sidekiq-unique-jobs running in minutes with a working code example
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Installation" icon="download" href="/installation">
+    Add the gem to your Gemfile and configure Sidekiq middleware
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Lock Types" icon="lock" href="/locks/overview">
+    Choose the right lock strategy for your job's lifecycle requirements
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Conflict Strategies" icon="shield-halved" href="/conflict/overview">
+    Control what happens when a duplicate job is detected
   </Card>
-</Columns>
+  <Card title="Configuration" icon="gear" href="/configuration/global">
+    Tune global defaults and per-job options for your environment
+  </Card>
+  <Card title="Upgrading" icon="arrow-up" href="/advanced/upgrading">
+    Upgrade from v8 to v9 — automatic migration, minimal changes
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## How it works
 
-Everything you need to create world-class documentation.
+sidekiq-unique-jobs intercepts jobs at enqueue time and execution time using Sidekiq middleware. When a job is pushed to Redis, the gem computes a digest from the job's class, queue, and arguments, then attempts to acquire a Redis lock for that digest. If the lock is already held, the configured conflict strategy takes effect — by default, the duplicate is silently dropped.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+<Steps>
+  <Step title="Install the gem">
+    Add `sidekiq-unique-jobs` to your Gemfile and run `bundle install`.
+  </Step>
+  <Step title="Configure middleware">
+    Register the client and server middleware in your Sidekiq initializer.
+  </Step>
+  <Step title="Add lock type to your job">
+    Set `sidekiq_options lock: :until_executed` on any Sidekiq worker class.
+  </Step>
+  <Step title="Observe and tune">
+    Use the Web UI, reflection hooks, and configuration options to monitor and fine-tune lock behavior.
+  </Step>
+</Steps>
 
-## Need inspiration?
+## Key features
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={2}>
+  <Card title="5 lock types" icon="layer-group" href="/locks/overview">
+    Cover every phase: enqueue-time, execution-time, TTL-based, and combination locks
+  </Card>
+  <Card title="5 conflict strategies" icon="traffic-cone" href="/conflict/strategies">
+    Log, raise, reject, replace, or reschedule when duplicates are detected
+  </Card>
+  <Card title="Custom lock arguments" icon="filter" href="/configuration/custom-lock-args">
+    Control exactly which job arguments determine uniqueness
+  </Card>
+  <Card title="Reflection hooks" icon="eye" href="/advanced/reflections">
+    Subscribe to lock lifecycle events for metrics and observability
+  </Card>
+  <Card title="Reliable fetch" icon="server" href="/advanced/reliable-fetch">
+    Crash recovery and lock-aware job acknowledgment for production resilience
+  </Card>
+  <Card title="Web UI" icon="display" href="/advanced/web-ui">
+    Browse, filter, and delete locks directly in the Sidekiq Web dashboard
+  </Card>
+</CardGroup>
+
+## Requirements
+
+- **Ruby** >= 3.2
+- **Sidekiq** >= 8.0
+- **Redis** >= 6.2 (LMOVE support required)

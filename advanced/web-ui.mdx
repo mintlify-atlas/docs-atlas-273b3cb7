@@ -1,0 +1,110 @@
+---
+title: 'Sidekiq Web UI Extension for Lock Management'
+description: 'Add a Locks tab to the Sidekiq Web UI to browse, filter, and delete Redis locks — plus the CLI commands for terminal-based lock management.'
+keywords: ['web ui', 'locks tab', 'sidekiq web', 'lock management', 'cli', 'sidekiq-unique-jobs']
+---
+
+sidekiq-unique-jobs ships an optional extension for the Sidekiq Web UI that adds a **Locks** tab to the existing web dashboard. From there you can browse all active locks, filter by pattern, inspect individual lock details, and delete locks individually or all at once. The same operations are also available through a command-line interface for environments where a browser is not practical.
+
+## Enabling the Web UI extension
+
+Require the web extension in the file where you mount Sidekiq::Web — typically `config/routes.rb`:
+
+```ruby
+# config/routes.rb
+require "sidekiq_unique_jobs/web"
+
+Rails.application.routes.draw do
+  mount Sidekiq::Web => "/sidekiq"
+end
+```
+
+That one `require` registers the extension with Sidekiq's Web UI and adds the **Locks** tab automatically. No additional configuration is needed.
+
+<Note>
+  The extension registers itself via `Sidekiq::Web.configure` when the file is required. If you require it before Sidekiq::Web is defined, you will see a load error — require it in the same file where you mount the web app, not in an early initializer.
+</Note>
+
+## What the Locks tab provides
+
+### Browse all locks
+
+The `/locks` route lists all active lock digests with pagination. Each row shows the digest identifier and its associated lock metadata if `config.lock_info = true` is enabled.
+
+### Filter by pattern
+
+Use the filter field at the top of the Locks page to narrow results by glob pattern. For example, entering `*MyWorker*` shows only digests that contain `MyWorker` in their key. The default pattern is `*` which matches everything.
+
+You can also control how many results appear per page with the `count` parameter.
+
+### Delete a single lock
+
+Click a digest in the list to open its detail page at `/locks/:digest`. From there, click **Delete** to remove that specific lock. You can also delete individual job entries within the lock's `LOCKED` hash, which is useful when only one of several parallel executions needs to be cleared.
+
+### Delete all locks
+
+The `/locks/delete_all` route deletes every lock matching the current filter. A button on the Locks index page triggers this. Use it with caution in production — deleting all locks allows previously-blocked duplicates to re-enter the system.
+
+<Warning>
+  Deleting locks manually bypasses all job uniqueness guarantees. A job whose lock you delete may re-enqueue immediately if there is already a duplicate waiting. Prefer deleting individual locks over deleting all at once in production environments.
+</Warning>
+
+## Route summary
+
+| Route | Action |
+|-------|--------|
+| `GET /locks` | List locks with optional `filter` and `count` params |
+| `GET /locks/delete_all` | Delete all locks matching the current filter |
+| `GET /locks/:digest` | Show details for a specific lock |
+| `GET /locks/:digest/delete` | Delete a specific lock |
+| `GET /locks/:digest/jobs/:job_id/delete` | Unlock a specific job from a lock |
+
+## CLI alternative
+
+If you manage your Sidekiq environment without a web interface, the gem provides a `uniquejobs` CLI that covers the same operations from the terminal.
+
+### List locks
+
+```bash
+bundle exec uniquejobs list
+```
+
+Pass a glob pattern as the first argument to filter results. The default pattern is `*` (all digests). Use `--count` (or `-c`) to limit how many digests are returned:
+
+```bash
+bundle exec uniquejobs list "*MyWorker*" --count 500
+```
+
+### Delete locks
+
+Pass a glob pattern to delete matching digests. Use `--dry-run` (or `-d`) to preview how many would be deleted without actually removing them:
+
+```bash
+# Preview what would be deleted
+bundle exec uniquejobs del "*MyWorker*" --dry-run
+
+# Actually delete matching digests
+bundle exec uniquejobs del "*MyWorker*"
+```
+
+### Open a console
+
+```bash
+bundle exec uniquejobs console
+```
+
+Opens an interactive Ruby console with `SidekiqUniqueJobs` loaded, connected to your Redis instance. Useful for scripted or bulk operations that the web UI does not expose directly.
+
+## Lock metrics in the UI
+
+When lock metrics are enabled, the Locks index page displays a breakdown of lock activity by type over the past 60 minutes. This requires `config.lock_info = true` in your global configuration and uses the `SidekiqUniqueJobs::LockMetrics` collection.
+
+```ruby
+SidekiqUniqueJobs.configure do |config|
+  config.lock_info = true
+end
+```
+
+<Tip>
+  Lock metrics add overhead to every lock operation because the gem writes additional metadata to Redis. Enable them during debugging or when you need the Web UI breakdown, then disable in production once you have tuned your configuration.
+</Tip>

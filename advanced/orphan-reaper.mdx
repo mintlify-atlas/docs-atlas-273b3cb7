@@ -1,0 +1,123 @@
+---
+title: 'Orphan Lock Reaper: Cleaning Up Stale Locks'
+description: 'Understand what orphan locks are, how the Ruby and Lua reaper implementations differ, and how to tune reaper settings for your workload.'
+keywords: ['orphan locks', 'reaper', 'stale locks', 'lua reaper', 'ruby reaper', 'sidekiq-unique-jobs']
+---
+
+When a Sidekiq worker process crashes mid-job, the Redis lock it held may never be released. That stale lock — called an orphan — blocks any future enqueue or execution of the same job until either the lock's TTL expires or someone removes it. The orphan reaper is a background process that detects and deletes these locks automatically.
+
+## What makes a lock an orphan
+
+A lock becomes orphaned when the worker that acquired it dies before calling `acknowledge`. This can happen due to:
+
+- An unhandled signal (SIGKILL, out-of-memory kill)
+- A hardware failure or VM termination
+- A process restart that does not drain in-flight jobs
+
+Without cleanup, orphaned locks accumulate in Redis and silently prevent valid jobs from running. The reaper identifies orphans by checking whether each locked digest still corresponds to a job anywhere in Sidekiq — in a queue, the retry set, the scheduled set, or an active worker. If no matching job is found, the lock is considered orphaned and deleted.
+
+## Two reaper implementations
+
+### Ruby reaper (default)
+
+The Ruby reaper (`config.reaper = :ruby`) runs in a dedicated background thread. It pages through locked digests and checks each one against Sidekiq's queues and sets using individual Redis calls. It short-circuits on the first match found for each digest.
+
+Because each check is a separate Redis command, no single operation blocks Redis for more than a few milliseconds. The tradeoff is slightly higher latency per cycle compared to the Lua reaper.
+
+The Ruby reaper is the right choice for most production applications.
+
+### Lua reaper
+
+The Lua reaper (`config.reaper = :lua`) executes a Lua script directly inside Redis. This makes the scan faster because all logic runs server-side with no round-trip overhead per digest.
+
+The downside is that Lua scripts in Redis are blocking — while the script runs, no other Redis command can execute. On a busy Redis instance, a large Lua reaper run can cause measurable latency spikes for all clients.
+
+<Warning>
+  Keep `reaper_count` at or below 1000 when using the Lua reaper. Large values can block Redis long enough to cause timeout errors in other parts of your application.
+</Warning>
+
+## Configuration
+
+Configure the reaper inside `SidekiqUniqueJobs.configure`:
+
+```ruby
+SidekiqUniqueJobs.configure do |config|
+  config.reaper          = :ruby   # :ruby (default), :lua, :none, or false
+  config.reaper_count    = 1000    # max digests to reap per cycle
+  config.reaper_interval = 600     # seconds between cycles (default: 10 minutes)
+  config.reaper_timeout  = 10      # max seconds a single cycle may run
+end
+```
+
+### Options reference
+
+<ParamField path="reaper" type="symbol" default=":ruby">
+  Which reaper implementation to use.
+
+  | Value | Behavior |
+  |-------|----------|
+  | `:ruby` | Background Ruby thread. Safe for all Redis deployments. |
+  | `:lua` | Lua script in Redis. Faster but blocks Redis during execution. |
+  | `:none` or `false` | Disables the reaper. Orphans must be cleaned up manually. |
+</ParamField>
+
+<ParamField path="reaper_count" type="integer" default="1000">
+  Maximum number of orphaned digests to delete in a single cycle. The reaper stops after deleting this many, even if more orphans remain. They will be caught in the next cycle.
+</ParamField>
+
+<ParamField path="reaper_interval" type="integer" default="600">
+  How often the reaper runs, in seconds. The default of 600 means every 10 minutes. Reduce this if your application creates many short-lived processes that crash frequently.
+</ParamField>
+
+<ParamField path="reaper_timeout" type="integer" default="10">
+  Maximum time a single reaper cycle is allowed to run, in seconds. The reaper checks this budget before each digest and stops early if the timeout would be exceeded. Prevents a slow Redis scan from occupying the reaper indefinitely.
+</ParamField>
+
+## Choosing the right reaper
+
+Use the Ruby reaper unless you have a specific reason to choose Lua:
+
+<CardGroup cols={2}>
+  <Card title="Ruby reaper" icon="gem">
+    Non-blocking Redis operations. Safe for shared or high-traffic Redis instances. Default for all new installations. Slightly slower per cycle than Lua.
+  </Card>
+  <Card title="Lua reaper" icon="bolt">
+    Faster scan — all logic runs inside Redis. Blocks Redis during execution. Only suitable when `reaper_count` is kept low. Appropriate for dedicated Redis instances with low concurrency.
+  </Card>
+</CardGroup>
+
+## Reaper resurrector
+
+The reaper runs inside a background thread managed by Sidekiq. If that thread crashes, a resurrector detects the failure and starts a new reaper thread automatically. This behavior is built in and requires no configuration.
+
+## Disabling the reaper
+
+Set `config.reaper = :none` (or `false`) to turn off automatic cleanup entirely. This is appropriate when:
+
+- You manage lock TTLs explicitly so that orphans expire on their own.
+- You use the Web UI or CLI to clean up locks manually.
+- You are running a test environment where cleanup is unnecessary.
+
+```ruby
+SidekiqUniqueJobs.configure do |config|
+  config.reaper = :none
+end
+```
+
+<Note>
+  Even with the reaper disabled, ReliableFetch still recovers in-flight jobs from crashed processes on startup. The reaper and ReliableFetch address different concerns: ReliableFetch recovers jobs, the reaper recovers locks.
+</Note>
+
+## How orphan detection works
+
+For each candidate digest, the Ruby reaper checks in this order:
+
+1. Does the `digest:LOCKED` hash have any entries? If not, skip (already clean).
+2. Is the digest present in the scheduled set?
+3. Is the digest present in the retry set?
+4. Is the digest present in any queue?
+5. Is the digest held by an active worker?
+
+The reaper short-circuits on the first match — if the digest is found anywhere, it is not an orphan. Only digests that pass all five checks without a match are deleted.
+
+The reaper also skips queue scanning entirely when total queue length exceeds 1,000 jobs. Very large queues would take too long to scan per cycle and likely indicate the system is already under load.

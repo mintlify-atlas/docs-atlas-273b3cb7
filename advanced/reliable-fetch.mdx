@@ -1,0 +1,101 @@
+---
+title: 'ReliableFetch: Crash Recovery for Sidekiq Jobs'
+description: 'Enable atomic job fetching with per-process working lists, startup crash recovery, and lock-aware acknowledgment to eliminate job loss on worker crashes.'
+keywords: ['reliable fetch', 'crash recovery', 'LMOVE', 'atomic fetch', 'working list', 'sidekiq-unique-jobs']
+---
+
+When a Sidekiq worker process crashes mid-execution, any job it was processing is at risk. The default fetch strategy pops a job from the Redis queue and hands it to the worker — if the process dies before the job completes, that job is simply gone. `SidekiqUniqueJobs::Fetch::Reliable` solves this by keeping jobs in a per-process working list until they are explicitly acknowledged, and recovering those jobs on the next startup.
+
+## How it works
+
+ReliableFetch wraps every queue operation around an atomic `LMOVE` command (available in Redis 6.2+). When a job is fetched, Redis moves it from the source queue into a per-process working list — a Redis list keyed to the process's hostname, PID, and a random hex suffix. The job stays in that working list until `acknowledge` is called. This means:
+
+- A crash between fetch and acknowledgment leaves the job in the working list, not lost.
+- On startup, the new process scans all working lists, finds any whose heartbeat has expired, and pushes those jobs back to their original queues.
+- During graceful shutdown, in-progress jobs are returned to the queue with their locks intact so they can be picked up immediately by another worker.
+
+Each running process publishes a heartbeat key in Redis with a 60-second TTL, refreshed every 20 seconds. If the heartbeat disappears, the process is considered dead and its working list is eligible for recovery.
+
+## Enabling ReliableFetch
+
+Configure the fetch class inside `Sidekiq.configure_server`:
+
+```ruby
+# config/initializers/sidekiq.rb
+Sidekiq.configure_server do |config|
+  config.client_middleware do |chain|
+    chain.add SidekiqUniqueJobs::Middleware::Client
+  end
+
+  config.server_middleware do |chain|
+    chain.add SidekiqUniqueJobs::Middleware::Server
+  end
+
+  config[:fetch_class] = SidekiqUniqueJobs::Fetch::Reliable
+
+  SidekiqUniqueJobs::Server.configure(config)
+end
+```
+
+<Note>
+  ReliableFetch requires Redis 6.2 or later for `LMOVE` and `BLMOVE` support. The base gem already requires Redis 6.2, so no additional setup is needed.
+</Note>
+
+## Features
+
+### Atomic LMOVE
+
+Fetching a job is a single atomic operation. No window exists between "dequeue" and "record" where a crash could lose the job. Non-blocking fetches use a Lua script that combines the LMOVE with lock validation in one round trip. The final queue in the poll list uses `BLMOVE` to block and wait rather than spin.
+
+### Crash recovery on startup
+
+When the process initializes, it scans all `uniquejobs:working:*` keys in Redis. For each working list that belongs to a process with no active heartbeat, it reads the job payloads and pushes them back to their original queues using `RPUSH`. The stale working list is then deleted with `UNLINK`.
+
+```ruby
+# This happens automatically during initialization — no manual steps required.
+# The log output shows how many jobs were recovered:
+# INFO -- : Recovered 3 orphaned jobs
+```
+
+### Lock-aware acknowledgment
+
+When a job finishes successfully, `acknowledge` calls a Lua script that atomically removes the job from the working list and handles lock cleanup according to the job's configured lock type. This keeps lock state and working list state consistent even under concurrent operations.
+
+### Lock-preserving requeue during shutdown
+
+On graceful shutdown, Sidekiq calls `bulk_requeue` with any in-progress jobs. ReliableFetch pushes those jobs back to their queues without touching their locks. The lock stays held so that when another worker picks up the job, it processes it as a continuation rather than a fresh duplicate.
+
+### Uniqueness lapse detection
+
+If a job is fetched but its lock entry is no longer present in Redis (for example, because the lock expired due to a TTL), ReliableFetch fires the `uniqueness_lapsed` reflection rather than silently discarding the job. The job still executes — the reflection is informational only.
+
+```ruby
+SidekiqUniqueJobs.reflect do |on|
+  on.uniqueness_lapsed do |job|
+    logger.warn("Lock expired before execution: #{job['class']} jid=#{job['jid']}")
+  end
+end
+```
+
+## When to use ReliableFetch
+
+Use ReliableFetch when:
+
+- Your application cannot afford to lose jobs on worker crashes, even without a job retry strategy.
+- You use lock types like `:until_executed` where a crash would otherwise leave an orphaned lock without a corresponding job in the queue.
+- You need deterministic lock cleanup on job completion rather than relying on TTL-based expiry.
+
+The default Sidekiq fetch strategy is adequate for most applications when jobs are idempotent and retries are enabled. ReliableFetch adds value when you need stronger delivery guarantees alongside uniqueness enforcement.
+
+<Warning>
+  ReliableFetch cannot coexist with other custom fetch strategies. If you are using another gem that sets `config[:fetch_class]`, you will need to choose one or coordinate the fetch behavior manually.
+</Warning>
+
+## Configuration summary
+
+| Setting | Location | Value |
+|---------|----------|-------|
+| Enable ReliableFetch | `config[:fetch_class]` | `SidekiqUniqueJobs::Fetch::Reliable` |
+| Heartbeat TTL | Built-in constant | 60 seconds |
+| Heartbeat refresh interval | Built-in constant | 20 seconds |
+| Blocking fetch timeout | Built-in constant | 2 seconds |

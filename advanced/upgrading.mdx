@@ -1,0 +1,113 @@
+---
+title: 'Upgrading sidekiq-unique-jobs from v8 to v9'
+description: 'What changes in v9, what migrates automatically on first startup, and the minimum Ruby, Sidekiq, and Redis versions required to upgrade.'
+keywords: ['upgrade', 'migration', 'v8 to v9', 'breaking changes', 'sidekiq-unique-jobs']
+---
+
+v9 of sidekiq-unique-jobs is a significant internal rework that reduces Redis key usage by over 80 percent, drops support for older runtimes, and simplifies the lock data model. For most applications, upgrading is a matter of updating the gem version, running `bundle update`, and deploying — migration of existing lock data happens automatically on the first server startup.
+
+## Requirements
+
+Before upgrading, verify your environment meets the v9 minimums:
+
+| Dependency | Minimum version |
+|------------|-----------------|
+| Ruby | 3.2 |
+| Sidekiq | 8.0 |
+| Redis | 6.2 |
+
+v9 drops support for Ruby < 3.2, Sidekiq 7, and Redis < 6.2. If you are running any of those, upgrade them before upgrading the gem.
+
+## Automatic data migration
+
+You do not need to write a migration script or run any manual Redis commands. When the first v9 Sidekiq process starts, it detects any v8 lock keys and converts them to the new format automatically. Existing jobs in the queue continue processing without interruption.
+
+<Note>
+  During a rolling deploy where some processes are still on v8, both formats coexist safely in Redis. The migration only runs once per process on startup, so it completes within the time it takes to cycle all your workers.
+</Note>
+
+## What changed in v9
+
+### Redis keys reduced from 13 to 2 per lock
+
+v8 maintained up to 13 Redis keys per unique lock, including separate keys for run digests, expiring digests, lock info, and more. v9 collapses this to 2 keys:
+
+- `uniquejobs:digests` — a single sorted set that tracks all lock digests, with the lock's expiry time as the score for TTL-based locks.
+- `{digest}:LOCKED` — a Redis hash that maps job IDs to lock ownership records.
+
+This change dramatically reduces memory usage on Redis and speeds up lock operations.
+
+### Expiring locks unified
+
+v8 maintained a separate `expiring_digests` sorted set for locks with a TTL. v9 removes this set. All digests — expiring and non-expiring — are stored in the same `uniquejobs:digests` ZSET. TTL-based locks use the expiry timestamp as the score; non-expiring locks use a fixed high score. The reaper and lock lookup use this score to distinguish between the two.
+
+### Sidekiq 8+ only
+
+v9 targets Sidekiq 8's internal APIs. It does not support Sidekiq 7 or earlier. The `Sidekiq::Component` mixin, `Sidekiq::Capsule` constructor signature, and Redis client interface all reflect Sidekiq 8 conventions.
+
+### Ruby 3.2+ only
+
+v9 uses Ruby 3.2 language features and drops compatibility shims for older versions. Pattern matching, endless range literals, and `Data` class usage appear throughout the codebase.
+
+### Redis 6.2+ required
+
+`LMOVE` and `BLMOVE` — used by ReliableFetch — were introduced in Redis 6.2. v9 makes Redis 6.2 a hard requirement because these commands are now part of the core data flow, not just an optional feature.
+
+### Changelog removed — use the reflection system
+
+The gem no longer ships a detailed changelog of lock events. If you were relying on log output from previous versions to track lock activity, replace that with the reflection system:
+
+```ruby
+SidekiqUniqueJobs.reflect do |on|
+  on.locked     { |job| Rails.logger.debug("Locked: #{job['class']}") }
+  on.unlocked   { |job| Rails.logger.debug("Unlocked: #{job['class']}") }
+  on.lock_failed { |job| Rails.logger.warn("Lock failed: #{job['class']}") }
+  on.duplicate  { |job| Rails.logger.warn("Duplicate: #{job['class']}") }
+end
+```
+
+See [Observing Lock Events with Reflections](/advanced/reflections) for all 14 reflection points.
+
+## Step-by-step upgrade
+
+<Steps>
+  <Step title="Verify environment requirements">
+    Check that your Ruby, Sidekiq, and Redis versions meet the v9 minimums listed above. Upgrade them if needed before touching the gem.
+  </Step>
+
+  <Step title="Update the gem">
+    Update `sidekiq-unique-jobs` in your Gemfile and run `bundle update`:
+
+    ```ruby
+    gem "sidekiq-unique-jobs", "~> 9.0"
+    ```
+
+    ```bash
+    bundle update sidekiq-unique-jobs
+    ```
+  </Step>
+
+  <Step title="Review your configuration">
+    Several configuration options changed or moved between v8 and v9. Compare your existing `SidekiqUniqueJobs.configure` block against the [global configuration reference](/configuration/global).
+
+    In particular, verify that `config.reaper` is set to `:ruby` (the safe default) rather than `:lua` if you were previously relying on the Lua reaper.
+  </Step>
+
+  <Step title="Replace log-based observability with reflections">
+    If your application logged gem output by grepping Sidekiq log lines, set up reflections in your initializer instead. The reflection system gives you structured access to the same events with no log parsing required.
+  </Step>
+
+  <Step title="Deploy and verify">
+    Deploy your updated code. The first server process to start will migrate any v8 lock data in Redis. Watch your logs for any `Recovered N orphaned jobs` messages which confirm the startup recovery ran. After all processes have cycled, v8 lock keys are gone and only the new v9 format remains.
+  </Step>
+</Steps>
+
+## Rollback considerations
+
+If you need to roll back to v8 after a v9 deploy:
+
+- v9 writes lock data in a format that v8 cannot read. Locks created after the v9 deploy will be invisible to v8 processes.
+- Rolling back mid-flight may leave jobs running without lock protection until the v8 reaper can clean up.
+- The safest rollback strategy is to drain all queues, flush the `uniquejobs:*` namespace in Redis, roll back the gem, and redeploy.
+
+If your queues cannot be drained, accept that some in-flight jobs may run without uniqueness enforcement during the transition window.
